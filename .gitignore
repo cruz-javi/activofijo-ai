@@ -1,0 +1,67 @@
+# Entornos virtuales y compilación Python
+.venv/
+venv/
+ENV/
+env/
+.uv/
+.Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Caches de pruebas, linters y cobertura
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.pytype/
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Variables de entorno y secretos (CRÍTICO)
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+!.env.example
+
+# Logs
+logs/
+*.log
+
+# Artefactos entrenados pesados y datasets locales
+models/*.joblib
+models/*.pkl
+models/*.onnx
+models/*.pt
+models/*.safetensors
+!models/.gitkeep
+*.csv
+*.parquet
+*.xlsx
+.ipynb_checkpoints/
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
