@@ -1,0 +1,28 @@
+services:
+  ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: activofijo-ai
+    restart: unless-stopped
+    environment:
+      PORT: 8000
+      ENV: production
+      AI_INTERNAL_API_KEY: ${AI_INTERNAL_API_KEY}
+      CORE_INTERNAL_URL: ${CORE_INTERNAL_URL:-http://core:3000}
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.groq.com/openai/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-llama-3.3-70b-versatile}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-25}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1024}
+    # Vinculado solo en loopback del host para inspección local; el acceso en producción es vía activofijo-net
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - activofijo-net
+
+networks:
+  activofijo-net:
+    external: true
+
