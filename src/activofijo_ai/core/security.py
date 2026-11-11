@@ -3,7 +3,7 @@ from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, status
 
-from app.config import Settings, get_settings
+from activofijo_ai.core.config import Settings, get_settings
 
 
 def verificar_clave_interna(
@@ -17,7 +17,10 @@ def verificar_clave_interna(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "codigo": "IA_CLAVE_INTERNA_NO_CONFIGURADA",
-                "mensaje": "AI_INTERNAL_API_KEY no está configurada correctamente en activofijo-ai (mínimo 32 caracteres).",
+                "mensaje": (
+                    "AI_INTERNAL_API_KEY no está configurada correctamente en activofijo-ai "
+                    "(mínimo 32 caracteres)."
+                ),
             },
         )
 
@@ -29,3 +32,4 @@ def verificar_clave_interna(
                 "mensaje": "Encabezado X-AI-Internal-Key ausente o inválido.",
             },
         )
+

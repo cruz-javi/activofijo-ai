@@ -2,8 +2,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.config import Settings, get_settings
-from app.main import create_app
+from activofijo_ai.core.config import Settings, get_settings
+from activofijo_ai.main import create_app
 
 CLAVE_TEST = "test_internal_ai_key_super_segura_32_caracteres!"
 
@@ -53,4 +53,3 @@ def test_estado_reporta_modelos_pendientes_sin_exponer_secretos(tmp_path: Path) 
     assert "gsk_secreto_no_exponer" not in resp.text
     assert all(modelo["cargado"] is False for modelo in body["modelos_ml"])
     assert "consultar_ficha_activo" in body["mcp"]["herramientas_registradas"]
-

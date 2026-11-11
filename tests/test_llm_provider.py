@@ -1,8 +1,8 @@
 import httpx
 import pytest
 
-from app.config import Settings
-from app.services.llm_provider import (
+from activofijo_ai.core.config import Settings
+from activofijo_ai.modules.llm.provider import (
     LlmErrorExternoError,
     LlmNoConfiguradoError,
     OpenAICompatibleLlmClient,
@@ -62,4 +62,3 @@ async def test_llm_mapea_rate_limit_429_como_error_externo() -> None:
         await client.generar_chat_completado([{"role": "user", "content": "hola"}])
 
     assert exc_info.value.status_code == 429
-

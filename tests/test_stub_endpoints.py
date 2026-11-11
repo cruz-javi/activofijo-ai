@@ -2,8 +2,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.config import Settings, get_settings
-from app.main import create_app
+from activofijo_ai.core.config import Settings, get_settings
+from activofijo_ai.main import create_app
 
 CLAVE_TEST = "test_internal_ai_key_super_segura_32_caracteres!"
 
@@ -54,4 +54,3 @@ def test_stubs_ml_y_llm_responden_501_controlado_con_clave_valida(tmp_path: Path
     )
     assert resp_llm.status_code == 501
     assert resp_llm.json()["detail"]["codigo"] == "ASISTENTE_EN_CONSTRUCCION"
-

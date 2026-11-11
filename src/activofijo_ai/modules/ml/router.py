@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.schemas.ml_schemas import PriorizacionRequest, PronosticoSerieRequest
-from app.security import verificar_clave_interna
+from activofijo_ai.core.security import verificar_clave_interna
+from activofijo_ai.modules.ml.schemas import PriorizacionRequest, PronosticoSerieRequest
 
 router = APIRouter(
     prefix="/v1/ml",
@@ -12,7 +12,7 @@ router = APIRouter(
 
 @router.post("/normativa/priorizar")
 def priorizar_normativa(_payload: PriorizacionRequest) -> None:
-    """Endpoint preparado para clasificación explicable CART + LightGBM (§3.3)."""
+    """Endpoint preparado para clasificación explicable CART + LightGBM."""
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail={
@@ -24,7 +24,7 @@ def priorizar_normativa(_payload: PriorizacionRequest) -> None:
 
 @router.post("/metricas/pronosticar")
 def pronosticar_metricas(_payload: PronosticoSerieRequest) -> None:
-    """Endpoint preparado para regresión predictiva Random Forest (§3.4)."""
+    """Endpoint preparado para regresión predictiva Random Forest."""
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail={

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.schemas.vision_schemas import OcrDocumentoRequest
-from app.security import verificar_clave_interna
+from activofijo_ai.core.security import verificar_clave_interna
+from activofijo_ai.modules.vision.schemas import OcrDocumentoRequest
 
 router = APIRouter(
     prefix="/v1/vision",
@@ -12,7 +12,7 @@ router = APIRouter(
 
 @router.post("/ocr-documento")
 def ocr_documento(_payload: OcrDocumentoRequest) -> None:
-    """Endpoint preparado para extracción óptica en documentos de respaldo Web (§3.5 / HU2-14)."""
+    """Endpoint preparado para extracción óptica en documentos de respaldo Web."""
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail={

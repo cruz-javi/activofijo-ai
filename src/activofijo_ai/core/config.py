@@ -5,6 +5,10 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _ruta_raiz_proyecto() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
 class Settings(BaseSettings):
     """Configuración validada por entorno para el microservicio activofijo-ai."""
 
@@ -26,9 +30,7 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = Field(default=25.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0, le=8192)
 
-    models_dir: Path = Field(
-        default_factory=lambda: Path(__file__).resolve().parent.parent / "models"
-    )
+    models_dir: Path = Field(default_factory=lambda: _ruta_raiz_proyecto() / "models")
 
 
 @lru_cache

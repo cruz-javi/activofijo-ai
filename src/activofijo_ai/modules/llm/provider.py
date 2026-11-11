@@ -3,8 +3,8 @@ from typing import Any
 
 import httpx
 
-from app.config import Settings
-from app.schemas.common import EstadoProveedorLlm
+from activofijo_ai.core.config import Settings
+from activofijo_ai.modules.system.schemas import EstadoProveedorLlm
 
 
 class LlmNoConfiguradoError(RuntimeError):

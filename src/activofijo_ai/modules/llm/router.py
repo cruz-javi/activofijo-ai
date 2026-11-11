@@ -1,10 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.schemas.llm_schemas import (
+from activofijo_ai.core.security import verificar_clave_interna
+from activofijo_ai.modules.llm.schemas import (
     ConsultaLenguajeNaturalRequest,
     RedaccionAsistidaRequest,
 )
-from app.security import verificar_clave_interna
 
 router = APIRouter(
     prefix="/v1/llm",
@@ -15,7 +15,7 @@ router = APIRouter(
 
 @router.post("/asistir-redaccion")
 def asistir_redaccion(_payload: RedaccionAsistidaRequest) -> None:
-    """Endpoint preparado para asistencia PLN en actas e informes (§3.6 / HU3-19)."""
+    """Endpoint preparado para asistencia PLN en actas e informes."""
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail={
@@ -27,7 +27,7 @@ def asistir_redaccion(_payload: RedaccionAsistidaRequest) -> None:
 
 @router.post("/interpretar-consulta")
 def interpretar_consulta(_payload: ConsultaLenguajeNaturalRequest) -> None:
-    """Endpoint preparado para traducción de lenguaje natural a filtros estructurados (HU1-06)."""
+    """Endpoint preparado para traducción de lenguaje natural a filtros estructurados."""
     raise HTTPException(
         status_code=status.HTTP_501_NOT_IMPLEMENTED,
         detail={

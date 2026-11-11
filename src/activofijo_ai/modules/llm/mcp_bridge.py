@@ -1,6 +1,6 @@
 import importlib.util
 
-from app.schemas.common import EstadoMcp
+from activofijo_ai.modules.system.schemas import EstadoMcp
 
 HERRAMIENTAS_MCP_PLANIFICADAS: list[str] = [
     "consultar_ficha_activo",
