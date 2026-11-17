@@ -1,0 +1,60 @@
+{
+  "modelo": "D:\\universidad\\s9\\taller\\proyecto activo fijo\\code\\activofijo-ai\\models\\pronostico_rf_v1.joblib",
+  "tamano_bytes": 126991,
+  "dataset_info": {
+    "periodos_mensuales": 120,
+    "movimientos_faker": 10940,
+    "gestiones": "2017-2026"
+  },
+  "metricas_validacion": {
+    "bajas_cant": {
+      "oob_r2": 0.9018,
+      "oob_rmse": 1.81,
+      "oob_mae": 1.37,
+      "holdout_2025_2026_r2": 0.7693,
+      "holdout_2025_2026_rmse": 2.95
+    },
+    "reposicion_bs": {
+      "oob_r2": 0.7711,
+      "oob_rmse": 13845.15,
+      "oob_mae": 10853.3,
+      "holdout_2025_2026_r2": 0.5539,
+      "holdout_2025_2026_rmse": 22240.12
+    },
+    "altas_cant": {
+      "oob_r2": 0.94,
+      "oob_rmse": 3.44,
+      "oob_mae": 2.34,
+      "holdout_2025_2026_r2": 0.7993,
+      "holdout_2025_2026_rmse": 7.14
+    },
+    "altas_monto_bs": {
+      "oob_r2": 0.8056,
+      "oob_rmse": 31724.48,
+      "oob_mae": 22158.99,
+      "holdout_2025_2026_r2": 0.7365,
+      "holdout_2025_2026_rmse": 41555.45
+    },
+    "reasignaciones_cant": {
+      "oob_r2": 0.9016,
+      "oob_rmse": 3.79,
+      "oob_mae": 2.75,
+      "holdout_2025_2026_r2": 0.7457,
+      "holdout_2025_2026_rmse": 6.71
+    },
+    "revaluos_cant": {
+      "oob_r2": 0.4179,
+      "oob_rmse": 0.99,
+      "oob_mae": 0.79,
+      "holdout_2025_2026_r2": 0.271,
+      "holdout_2025_2026_rmse": 1.04
+    },
+    "revaluos_monto_bs": {
+      "oob_r2": 0.0868,
+      "oob_rmse": 3936.24,
+      "oob_mae": 3172.8,
+      "holdout_2025_2026_r2": 0.0,
+      "holdout_2025_2026_rmse": 4311.64
+    }
+  }
+}

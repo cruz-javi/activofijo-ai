@@ -1,11 +1,14 @@
 # Entrenamiento Offline (`training/`)
 
-Esta carpeta alojará los scripts reproducibles de entrenamiento y calibración fuera de línea (no se ejecutan en el contenedor de producción EC2):
+Esta carpeta aloja los scripts reproducibles de generación de datasets sintéticos con **Faker** y entrenamiento fuera de línea para `activofijo-ai`:
 
-1. `train_priorizador_cart_lgbm.py` *(pendiente Sprint 3)*: entrenamiento de Árboles de Decisión (CART) y LightGBM para priorización normativa (`HU2-07`, `HU2-14`, `HU3-20`), exportando artefactos `.joblib` y reglas de corte explicables a `../models/`.
-2. `train_pronostico_rf.py` *(pendiente Sprint 3)*: entrenamiento de *Random Forest Regressor* sobre series temporales de bajas y reposición patrimonial con validación temporal ($RMSE$ y $R^2$).
-3. `export_crnn_onnx.py` *(pendiente Sprint 3)*: exportación a ONNX Runtime ligero para extracción óptica documental en Web (`HU2-14`).
+1. `generar_dataset_faker.py`: genera con `Faker("es_ES")` y parámetros contables UAGRM (`D.S. 24051` / `R.R. 449/2013` / `R.R. 567/2018`):
+   - `training/datasets/movimientos_patrimoniales_faker.csv` (movimientos individuales de altas, bajas, reasignaciones y revalúos 2017–2026),
+   - `training/datasets/series_mensuales_uagrm.csv` (120 períodos mensuales consolidados).
+2. `train_pronostico_rf.py`: entrena los ensambles **Random Forest Regressor** (`n_estimators=100`, muestreo Bootstrap, submuestreo `sqrt` e importancia por reducción de varianza), valida métricas OOB y hold-out temporal (`2025-2026`), y exporta el artefacto ligero `models/pronostico_rf_v1.joblib`.
+3. `train_priorizador_cart_lgbm.py` / `export_crnn_onnx.py` *(pendientes Sprint 3)*.
 
-> Para instalar dependencias científicas de entrenamiento localmente:
-> `uv pip install -e ".[dev,ml]"`
-
+> Para ejecutar la generación y reentrenamiento localmente:
+> ```bash
+> .venv/Scripts/python.exe training/train_pronostico_rf.py
+> ```
