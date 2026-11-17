@@ -48,7 +48,7 @@ def test_estado_reporta_modelos_pendientes_sin_exponer_secretos(tmp_path: Path) 
     assert resp.status_code == 200
     body = resp.json()
     assert body["estado"] == "operativo_sin_modelos"
-    assert body["llm"]["proveedor"] == "groq"
+    assert body["llm"]["proveedor"] == "ollama"
     assert body["llm"]["api_key_configurada"] is True
     assert "gsk_secreto_no_exponer" not in resp.text
     assert all(modelo["cargado"] is False for modelo in body["modelos_ml"])

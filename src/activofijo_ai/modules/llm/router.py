@@ -1,9 +1,17 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Annotated
 
+from fastapi import APIRouter, Depends
+
+from activofijo_ai.core.config import Settings, get_settings
 from activofijo_ai.core.security import verificar_clave_interna
+from activofijo_ai.modules.llm.mcp_bridge import McpBridgeService
 from activofijo_ai.modules.llm.schemas import (
+    AyudaSistemaRequest,
+    AyudaSistemaResponse,
     ConsultaLenguajeNaturalRequest,
+    ConsultaLenguajeNaturalResponse,
     RedaccionAsistidaRequest,
+    RedaccionAsistidaResponse,
 )
 
 router = APIRouter(
@@ -13,26 +21,36 @@ router = APIRouter(
 )
 
 
-@router.post("/asistir-redaccion")
-def asistir_redaccion(_payload: RedaccionAsistidaRequest) -> None:
-    """Endpoint preparado para asistencia PLN en actas e informes."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "codigo": "ASISTENTE_EN_CONSTRUCCION",
-            "mensaje": "La redacción asistida con Groq + MCP se habilitará en la siguiente fase de Sprint 3.",
-        },
-    )
+def get_mcp_bridge_service() -> McpBridgeService:
+    """Provee el servicio orquestador MCP + LLM."""
+    return McpBridgeService()
 
 
-@router.post("/interpretar-consulta")
-def interpretar_consulta(_payload: ConsultaLenguajeNaturalRequest) -> None:
-    """Endpoint preparado para traducción de lenguaje natural a filtros estructurados."""
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "codigo": "ASISTENTE_EN_CONSTRUCCION",
-            "mensaje": "El intérprete de consultas en lenguaje natural se habilitará en la siguiente fase de Sprint 3.",
-        },
-    )
+@router.post("/asistir-redaccion", response_model=RedaccionAsistidaResponse)
+async def asistir_redaccion(
+    payload: RedaccionAsistidaRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> RedaccionAsistidaResponse:
+    """Redacta cartas, descargos e informes técnicos UAGRM con anclaje MCP sin alucinaciones."""
+    return await mcp.asistir_redaccion(payload, settings)
 
+
+@router.post("/interpretar-consulta", response_model=ConsultaLenguajeNaturalResponse)
+async def interpretar_consulta(
+    payload: ConsultaLenguajeNaturalRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> ConsultaLenguajeNaturalResponse:
+    """Traduce peticiones en lenguaje natural a filtros estructurados y resume lotes de reporte."""
+    return await mcp.interpretar_consulta_reporte(payload, settings)
+
+
+@router.post("/asistente-sistema", response_model=AyudaSistemaResponse)
+async def asistente_sistema(
+    payload: AyudaSistemaRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> AyudaSistemaResponse:
+    """Asistente guiado del sistema UAGRM con enlaces directos filtrados por permisos RBAC."""
+    return await mcp.responder_ayuda_sistema(payload, settings)

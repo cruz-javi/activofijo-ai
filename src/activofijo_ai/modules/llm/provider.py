@@ -1,3 +1,5 @@
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,8 +28,29 @@ class ResultadoChatLlm:
     tokens_usados: int
 
 
+def extraer_json_objeto(texto: str) -> dict[str, Any] | None:
+    """Extrae el primer objeto JSON válido incluso si viene envuelto en cercas markdown."""
+    limpio = texto.strip()
+    if limpio.startswith("```"):
+        limpio = re.sub(r"^```(?:json)?\s*", "", limpio, flags=re.IGNORECASE)
+        limpio = re.sub(r"\s*```$", "", limpio)
+
+    try:
+        parsed = json.loads(limpio)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", limpio)
+        if not match:
+            return None
+        try:
+            parsed = json.loads(match.group(0))
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            return None
+
+
 class OpenAICompatibleLlmClient:
-    """Adaptador asíncrono compatible con Groq (https://api.groq.com/openai/v1) y Ollama."""
+    """Adaptador asíncrono compatible con Ollama local (`uagrm-activo-fijo`) y Groq."""
 
     def __init__(
         self,
@@ -39,11 +62,12 @@ class OpenAICompatibleLlmClient:
 
     def obtener_estado(self) -> EstadoProveedorLlm:
         """Devuelve el estado de configuración del proveedor LLM sin exponer credenciales."""
+        es_local = self._settings.llm_provider.lower() == "ollama"
         return EstadoProveedorLlm(
             proveedor=self._settings.llm_provider,
             modelo=self._settings.llm_model,
             base_url=self._settings.llm_base_url,
-            api_key_configurada=bool(self._settings.llm_api_key.strip()),
+            api_key_configurada=es_local or bool(self._settings.llm_api_key.strip()),
         )
 
     async def generar_chat_completado(
@@ -53,9 +77,10 @@ class OpenAICompatibleLlmClient:
     ) -> ResultadoChatLlm:
         """Envía una solicitud Chat Completions al proveedor OpenAI-compatible configurado."""
         api_key = self._settings.llm_api_key.strip()
-        if not api_key and self._settings.llm_provider.lower() != "ollama":
+        es_ollama = self._settings.llm_provider.lower() == "ollama"
+        if not api_key and not es_ollama:
             raise LlmNoConfiguradoError(
-                "LLM_API_KEY no configurada. Configure su clave de Groq o proveedor compatible."
+                "LLM_API_KEY no configurada. Configure Ollama local o una clave compatible."
             )
 
         url = f"{self._settings.llm_base_url.rstrip('/')}/chat/completions"
@@ -63,55 +88,68 @@ class OpenAICompatibleLlmClient:
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        payload: dict[str, Any] = {
-            "model": self._settings.llm_model,
-            "messages": mensajes,
-            "max_tokens": self._settings.llm_max_tokens,
-            "temperature": 0.2,
-        }
-        if response_format is not None:
-            payload["response_format"] = response_format
+        modelos_a_intentar = [self._settings.llm_model]
+        if es_ollama and self._settings.llm_model != "qwen2.5:3b":
+            modelos_a_intentar.append("qwen2.5:3b")
 
-        try:
-            async with httpx.AsyncClient(
-                timeout=self._settings.llm_timeout_seconds,
-                transport=self._transport,
-            ) as client:
-                response = await client.post(url, headers=headers, json=payload)
-        except httpx.TimeoutException as exc:
-            raise LlmErrorExternoError(
-                "Tiempo de espera agotado al consultar el proveedor LLM.", status_code=504
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise LlmErrorExternoError(
-                f"Error de red al comunicarse con el proveedor LLM: {exc}", status_code=502
-            ) from exc
+        ultimo_error: LlmErrorExternoError | None = None
 
-        if response.status_code == 429:
-            raise LlmErrorExternoError(
-                "Límite de tasa del proveedor LLM alcanzado (HTTP 429). Reintente en unos segundos.",
-                status_code=429,
+        for modelo in modelos_a_intentar:
+            payload: dict[str, Any] = {
+                "model": modelo,
+                "messages": mensajes,
+                "max_tokens": self._settings.llm_max_tokens,
+                "temperature": 0.15,
+            }
+            if response_format is not None:
+                payload["response_format"] = response_format
+
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self._settings.llm_timeout_seconds,
+                    transport=self._transport,
+                ) as client:
+                    response = await client.post(url, headers=headers, json=payload)
+            except httpx.TimeoutException as exc:
+                raise LlmErrorExternoError(
+                    "Tiempo de espera agotado al consultar el proveedor LLM.", status_code=504
+                ) from exc
+            except httpx.HTTPError as exc:
+                raise LlmErrorExternoError(
+                    f"Error de red al comunicarse con el proveedor LLM: {exc}", status_code=502
+                ) from exc
+
+            if response.status_code == 404 and es_ollama and modelo != modelos_a_intentar[-1]:
+                continue
+
+            if response.status_code == 429:
+                raise LlmErrorExternoError(
+                    "Límite de tasa del proveedor LLM alcanzado (HTTP 429). Reintente en unos segundos.",
+                    status_code=429,
+                )
+
+            if response.status_code >= 400:
+                ultimo_error = LlmErrorExternoError(
+                    f"El proveedor LLM respondió HTTP {response.status_code}.",
+                    status_code=response.status_code,
+                )
+                break
+
+            data = response.json()
+            choices = data.get("choices") or []
+            if not choices or not isinstance(choices[0], dict):
+                raise LlmErrorExternoError("Respuesta del proveedor LLM sin opciones válidas.")
+
+            mensaje = choices[0].get("message") or {}
+            contenido = str(mensaje.get("content") or "")
+            usage = data.get("usage") or {}
+            tokens = int(usage.get("total_tokens") or 0)
+
+            return ResultadoChatLlm(
+                contenido=contenido,
+                modelo=str(data.get("model") or modelo),
+                tokens_usados=tokens,
             )
 
-        if response.status_code >= 400:
-            raise LlmErrorExternoError(
-                f"El proveedor LLM respondió HTTP {response.status_code}.",
-                status_code=response.status_code,
-            )
-
-        data = response.json()
-        choices = data.get("choices") or []
-        if not choices or not isinstance(choices[0], dict):
-            raise LlmErrorExternoError("Respuesta del proveedor LLM sin opciones válidas.")
-
-        mensaje = choices[0].get("message") or {}
-        contenido = str(mensaje.get("content") or "")
-        usage = data.get("usage") or {}
-        tokens = int(usage.get("total_tokens") or 0)
-
-        return ResultadoChatLlm(
-            contenido=contenido,
-            modelo=str(data.get("model") or self._settings.llm_model),
-            tokens_usados=tokens,
-        )
-
+        assert ultimo_error is not None
+        raise ultimo_error
