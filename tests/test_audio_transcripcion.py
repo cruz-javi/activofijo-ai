@@ -97,3 +97,51 @@ def test_transcribir_audio_wav_en_ram_devuelve_texto(tmp_path: Path) -> None:
         assert body["motor_utilizado"] == "faster_whisper_local"
         assert body["modelo"] == "whisper-base-int8"
         assert body["idioma_detectado"] == "es"
+
+
+class _WhisperInspeccionFake:
+    def __init__(self, texto_fijo: str) -> None:
+        self._texto_fijo = texto_fijo
+
+    def transcribe(self, audio, **_kwargs):
+        assert audio.size >= 1600
+        return [_SegmentoFake(text=self._texto_fijo)], _InfoFake()
+
+
+def test_interpretar_inspeccion_voz_casos_campo(tmp_path: Path) -> None:
+    casos = [
+        ("esta en buen esta", "BUENO", "", "completar", False),
+        ("esta en mal estado le falta una pata a la mesa", "MALO", "Le falta una pata a la mesa", "completar", False),
+        ("le cambiaron el color", None, "Le cambiaron el color", "completar", False),
+        ("enviar", None, "", "confirmar", True),
+        ("aceptar", None, "", "confirmar", True),
+        ("confirmar y guardar", None, "", "confirmar", True),
+        ("cancelar", None, "", "cancelar", False),
+        ("regular, raspado en esquina", "REGULAR", "Raspado en esquina", "completar", False),
+    ]
+
+    settings = Settings(env="test", ai_internal_api_key=CLAVE_TEST, models_dir=tmp_path)
+    for texto_dicho, est_esp, obs_esp, accion_esp, conf_esp in casos:
+        app = create_app()
+        app.dependency_overrides[get_settings] = lambda s=settings: s
+        app.dependency_overrides[get_servicio_transcripcion_voz] = lambda t=texto_dicho: ServicioTranscripcionVoz(
+            nombre_modelo="base",
+            modelo_inyectado=_WhisperInspeccionFake(t),
+        )
+        with TestClient(app) as client:
+            res = client.post(
+                "/v1/audio/interpretar-inspeccion",
+                headers={"X-AI-Internal-Key": CLAVE_TEST},
+                json={
+                    "audio_base64": _wav_base64(0.6),
+                    "mime_type": "audio/wav",
+                    "idioma": "es-BO",
+                },
+            )
+        assert res.status_code == 200
+        body = res.json()
+        assert body["estado_fisico"] == est_esp
+        assert body["observacion"] == obs_esp
+        assert body["accion"] == accion_esp
+        assert body["confirma_directo"] is conf_esp
+        assert body["motor_interpretacion"] == "reglas_rapidas"

@@ -28,6 +28,10 @@ _MAP_FORMATOS_AV: dict[str, str] = {
     "wave": "wav",
     "mp4": "mp4",
     "m4a": "mp4",
+    "x-m4a": "mp4",
+    "aac": "aac",
+    "3gpp": "3gp",
+    "3gp": "3gp",
     "mpeg": "mp3",
     "mp3": "mp3",
 }

@@ -84,6 +84,8 @@ class OpenAICompatibleLlmClient:
         response_format: dict[str, Any] | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
+        timeout_override: float | None = None,
+        max_tokens_override: int | None = None,
     ) -> ResultadoChatLlm:
         """Envía una solicitud Chat Completions (con soporte tool_calls ReAct) al proveedor LLM."""
         api_key = self._settings.llm_api_key.strip()
@@ -108,7 +110,7 @@ class OpenAICompatibleLlmClient:
             payload: dict[str, Any] = {
                 "model": modelo,
                 "messages": mensajes,
-                "max_tokens": self._settings.llm_max_tokens,
+                "max_tokens": max_tokens_override or self._settings.llm_max_tokens,
                 "temperature": 0.1,
             }
             if response_format is not None and not tools:
@@ -119,7 +121,7 @@ class OpenAICompatibleLlmClient:
 
             try:
                 async with httpx.AsyncClient(
-                    timeout=self._settings.llm_timeout_seconds,
+                    timeout=timeout_override or self._settings.llm_timeout_seconds,
                     transport=self._transport,
                 ) as client:
                     response = await client.post(url, headers=headers, json=payload)

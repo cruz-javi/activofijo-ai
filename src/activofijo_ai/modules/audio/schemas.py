@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -13,4 +15,15 @@ class TranscribirAudioResponse(BaseModel):
     duracion_audio_seg: float = Field(default=0.0, ge=0.0)
     modelo: str = "whisper-base-int8"
     motor_utilizado: str = "faster_whisper_local"
+    tiempo_ms: int = Field(default=0, ge=0)
+
+
+class InterpretarInspeccionVozResponse(BaseModel):
+    texto_transcrito: str = ""
+    estado_fisico: Literal["BUENO", "REGULAR", "MALO"] | None = None
+    observacion: str = ""
+    accion: Literal["completar", "confirmar", "cancelar"] = "completar"
+    confirma_directo: bool = False
+    motor_transcripcion: str = "faster_whisper_local"
+    motor_interpretacion: str = "reglas_rapidas"
     tiempo_ms: int = Field(default=0, ge=0)
