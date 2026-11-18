@@ -3,10 +3,12 @@ from pathlib import Path
 
 import httpx
 from fastapi.testclient import TestClient
+from mcp.shared.memory import create_connected_server_and_client_session
 
 from activofijo_ai.core.config import Settings, get_settings
 from activofijo_ai.main import create_app
 from activofijo_ai.modules.llm.mcp_bridge import McpBridgeService
+from activofijo_ai.modules.llm.mcp_server import mcp_server
 from activofijo_ai.modules.llm.router import get_mcp_bridge_service
 
 CLAVE_TEST = "test_internal_ai_key_super_segura_32_caracteres!"
@@ -208,3 +210,93 @@ def test_asistente_sistema_respeta_rbac_y_bloquea_fuera_de_dominio(tmp_path: Pat
     assert resp_off.status_code == 200
     assert resp_off.json()["fuera_de_ambito"] is True
     assert resp_off.json()["enlaces_directos"] == []
+
+
+async def test_servidor_fastmcp_nativo_expone_recursos_tools_y_prompts() -> None:
+    async with create_connected_server_and_client_session(mcp_server._mcp_server) as session:
+        tools_res = await session.list_tools()
+        tool_names = {t.name for t in tools_res.tools}
+        assert {
+            "consultar_ficha_activo",
+            "consultar_reglas_normativas",
+            "filtrar_catalogo_reportes",
+            "resumir_lote_patrimonial",
+            "consultar_guia_sistema",
+            "validar_integridad_texto",
+        }.issubset(tool_names)
+
+        resources_res = await session.list_resources()
+        assert "uagrm://normativa/catalogo" in {str(r.uri) for r in resources_res.resources}
+
+        prompts_res = await session.list_prompts()
+        assert {
+            "prompt_redaccion_carta_uagrm",
+            "prompt_interpretar_reporte_uagrm",
+            "prompt_asistente_sistema_uagrm",
+        }.issubset({p.name for p in prompts_res.prompts})
+
+        ficha_call = await session.call_tool(
+            "consultar_ficha_activo",
+            {
+                "cod_activo": "U04000018",
+                "sanitizar_publico": True,
+                "contexto_activo": {
+                    "codigo": "U04000018",
+                    "descripcion": "Servidor blade",
+                    "costo": 1500,
+                    "ci": "9999999",
+                    "nit": "1234567",
+                },
+            },
+        )
+        assert ficha_call.structuredContent is not None
+        assert ficha_call.structuredContent["costo_bs"] == "Bs. 1.500,00"
+        recurso = ficha_call.structuredContent["recurso_activo_mcp"]
+        assert "ci" not in recurso and "nit" not in recurso
+
+
+def test_endpoint_jsonrpc_streamable_http_mcp_protegido(tmp_path: Path) -> None:
+    app = create_app()
+    settings = Settings(env="test", ai_internal_api_key=CLAVE_TEST, models_dir=tmp_path)
+    app.dependency_overrides[get_settings] = lambda: settings
+
+    mcp_headers = {
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+    }
+
+    with TestClient(app) as client:
+        unauth = client.post(
+            "/mcp/",
+            headers=mcp_headers,
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert unauth.status_code == 401
+
+        auth_list = client.post(
+            "/mcp/",
+            headers={**mcp_headers, "X-AI-Internal-Key": CLAVE_TEST},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert auth_list.status_code == 200
+        rpc_body = auth_list.json()
+        assert any(t["name"] == "filtrar_catalogo_reportes" for t in rpc_body["result"]["tools"])
+
+        auth_call = client.post(
+            "/mcp/",
+            headers={**mcp_headers, "X-AI-Internal-Key": CLAVE_TEST},
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "filtrar_catalogo_reportes",
+                    "arguments": {"consulta_usuario": "vehiculos en estado malo de la FICCT"},
+                },
+            },
+        )
+        assert auth_call.status_code == 200
+        call_result = auth_call.json()["result"]
+        assert call_result["structuredContent"]["grupo_contable"] == "VEHÍCULOS"
+        assert call_result["structuredContent"]["condicion"] == "MALO"
+        assert call_result["structuredContent"]["ubicacion"] == "FICCT"

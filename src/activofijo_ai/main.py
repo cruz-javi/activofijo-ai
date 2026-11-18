@@ -2,7 +2,12 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
+from activofijo_ai.core.config import get_settings
+from activofijo_ai.core.security import validar_clave_interna_valor
+from activofijo_ai.modules.llm.mcp_server import crear_servidor_mcp
 from activofijo_ai.modules.llm.router import router as llm_router
 from activofijo_ai.modules.ml.router import router as ml_router
 from activofijo_ai.modules.system.router import router as system_router
@@ -10,15 +15,44 @@ from activofijo_ai.modules.vision.engine import obtener_motor_rapidocr_compartid
 from activofijo_ai.modules.vision.router import router as vision_router
 
 
-@asynccontextmanager
-async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Precalienta en CPU los modelos ONNX livianos al iniciar el contenedor/servidor."""
-    obtener_motor_rapidocr_compartido()
-    yield
+class _ProteccionClaveInternaMcpMiddleware:
+    """Exige X-AI-Internal-Key también en el endpoint ASGI StreamableHTTP /mcp."""
+
+    def __init__(self, app_destino: ASGIApp, fastapi_app: FastAPI) -> None:
+        self._app_destino = app_destino
+        self._fastapi_app = fastapi_app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            headers = {
+                k.decode("latin-1").lower(): v.decode("latin-1")
+                for k, v in scope.get("headers", [])
+            }
+            proveedor_settings = self._fastapi_app.dependency_overrides.get(
+                get_settings, get_settings
+            )
+            settings = proveedor_settings()
+            error = validar_clave_interna_valor(settings, headers.get("x-ai-internal-key"))
+            if error is not None:
+                codigo_http, detalle = error
+                respuesta = JSONResponse(status_code=codigo_http, content={"detail": detalle})
+                await respuesta(scope, receive, send)
+                return
+
+        await self._app_destino(scope, receive, send)
 
 
 def create_app() -> FastAPI:
-    """Construye la aplicación FastAPI modular de activofijo-ai."""
+    """Construye la aplicación FastAPI modular de activofijo-ai con servidor FastMCP integrado."""
+    servidor_mcp = crear_servidor_mcp()
+
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        """Precalienta ONNX en CPU y administra el gestor de sesiones StreamableHTTP MCP."""
+        obtener_motor_rapidocr_compartido()
+        async with servidor_mcp.session_manager.run():
+            yield
+
     app = FastAPI(
         title="UAGRM Activo Fijo AI Service",
         description="Microservicio interno privado de ML, Visión Artificial y orquestación LLM/MCP.",
@@ -30,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(ml_router)
     app.include_router(vision_router)
     app.include_router(llm_router)
+    app.mount("/mcp", _ProteccionClaveInternaMcpMiddleware(servidor_mcp.streamable_http_app(), app))
     return app
 
 

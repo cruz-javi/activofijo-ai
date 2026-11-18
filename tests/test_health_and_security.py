@@ -52,4 +52,7 @@ def test_estado_reporta_modelos_pendientes_sin_exponer_secretos(tmp_path: Path) 
     assert body["llm"]["api_key_configurada"] is True
     assert "gsk_secreto_no_exponer" not in resp.text
     assert all(modelo["cargado"] is False for modelo in body["modelos_ml"])
+    assert body["mcp"]["habilitado"] is True
     assert "consultar_ficha_activo" in body["mcp"]["herramientas_registradas"]
+    assert "uagrm://normativa/catalogo" in body["mcp"]["recursos_registrados"]
+    assert "prompt_redaccion_carta_uagrm" in body["mcp"]["prompts_registrados"]

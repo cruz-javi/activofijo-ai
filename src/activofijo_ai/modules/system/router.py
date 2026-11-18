@@ -29,10 +29,10 @@ def health_check(settings: Annotated[Settings, Depends(get_settings)]) -> Health
     dependencies=[Depends(verificar_clave_interna)],
     tags=["Estado"],
 )
-def estado_servicio(
+async def estado_servicio(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> EstadoServicioIaResponse:
-    """Reporta la disponibilidad de modelos en disco, configuración LLM y herramientas MCP."""
+    """Reporta la disponibilidad de modelos en disco, configuración LLM y capacidades reales FastMCP."""
     modelos = inspeccionar_modelos_en_disco(settings.models_dir)
     todos_listos = all(modelo.cargado for modelo in modelos)
 
@@ -40,6 +40,6 @@ def estado_servicio(
         estado="operativo" if todos_listos else "operativo_sin_modelos",
         modelos_ml=modelos,
         llm=OpenAICompatibleLlmClient(settings).obtener_estado(),
-        mcp=McpBridgeService().obtener_estado(),
+        mcp=await McpBridgeService().obtener_estado(),
     )
 

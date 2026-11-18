@@ -1,16 +1,17 @@
+"""Puente orquestador entre el servidor FastMCP institucional y el LLM local Ollama."""
+
 import importlib.util
-import re
-import unicodedata
+import json
 from datetime import datetime
 from typing import Any
 
+from mcp.server.fastmcp import FastMCP
+
 from activofijo_ai.core.config import Settings
-from activofijo_ai.modules.llm.knowledge import (
-    GUIA_RUTAS_SISTEMA,
-    PALABRAS_BLOQUEO_EXTERNO,
-    PALABRAS_DOMINIO_VALIDO,
-    PLANTILLAS_CARTAS,
-    RutaSistemaGuia,
+from activofijo_ai.modules.llm.mcp_server import (
+    construir_parrafo_respaldo_activo,
+    mcp_server,
+    normalizar_moneda_texto,
 )
 from activofijo_ai.modules.llm.provider import (
     LlmErrorExternoError,
@@ -30,14 +31,6 @@ from activofijo_ai.modules.llm.schemas import (
 )
 from activofijo_ai.modules.system.schemas import EstadoMcp
 
-HERRAMIENTAS_MCP_PLANIFICADAS: list[str] = [
-    "consultar_ficha_activo",
-    "consultar_reglas_normativas",
-    "filtrar_catalogo_reportes",
-    "consultar_guia_sistema",
-    "validar_integridad_texto",
-]
-
 MESES_ES = (
     "enero",
     "febrero",
@@ -54,26 +47,9 @@ MESES_ES = (
 )
 
 
-def _normalizar_texto(texto: str) -> str:
-    sin_tildes = "".join(
-        c for c in unicodedata.normalize("NFD", texto.lower()) if unicodedata.category(c) != "Mn"
-    )
-    return re.sub(r"\s+", " ", sin_tildes).strip()
-
-
 def _fecha_bolivia_formal() -> str:
     hoy = datetime.now()
-    mes = MESES_ES[hoy.month - 1]
-    return f"Santa Cruz de la Sierra, {hoy.day:02d} de {mes} de {hoy.year}"
-
-
-def _formatear_bs(valor: Any) -> str:
-    try:
-        num = float(valor or 0)
-    except (TypeError, ValueError):
-        num = 0.0
-    monto_es = f"{num:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"Bs. {monto_es}"
+    return f"Santa Cruz de la Sierra, {hoy.day:02d} de {MESES_ES[hoy.month - 1]} de {hoy.year}"
 
 
 def _resolver_motor(settings: Settings) -> tuple[str, str]:
@@ -82,27 +58,66 @@ def _resolver_motor(settings: Settings) -> tuple[str, str]:
     return "llm_remoto", settings.llm_model
 
 
-def _tiene_permiso(permiso_requerido: str | None, permisos_usuario: list[str], rol: str) -> bool:
-    if permiso_requerido is None:
-        return True
-    rol_up = rol.upper()
-    if rol_up in {"ADMINISTRADOR", "SUPER_ADMIN", "ADMIN"}:
-        return True
-    return permiso_requerido in permisos_usuario
+def _extraer_dict_tool_mcp(resultado: Any) -> dict[str, Any]:
+    if isinstance(resultado, tuple) and len(resultado) == 2 and isinstance(resultado[1], dict):
+        return dict(resultado[1])
+    if isinstance(resultado, dict):
+        return resultado
+    if isinstance(resultado, list) and resultado:
+        primero = resultado[0]
+        texto = getattr(primero, "text", None)
+        if isinstance(texto, str):
+            data = json.loads(texto)
+            if isinstance(data, dict):
+                return data
+    return {}
+
+
+def _extraer_json_recurso_mcp(contenidos: Any) -> dict[str, Any]:
+    lista = list(contenidos or [])
+    if not lista:
+        return {}
+    raw = getattr(lista[0], "content", "")
+    if isinstance(raw, str) and raw.strip():
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _extraer_texto_prompt_mcp(prompt_result: Any) -> str:
+    mensajes = getattr(prompt_result, "messages", []) or []
+    partes: list[str] = []
+    for msg in mensajes:
+        contenido = getattr(msg, "content", None)
+        texto = getattr(contenido, "text", None)
+        if isinstance(texto, str) and texto.strip():
+            partes.append(texto.strip())
+    return "\n\n".join(partes)
 
 
 class McpBridgeService:
-    """Puente MCP de solo lectura hacia recursos UAGRM, validación y orquestación LLM local."""
+    """Orquesta Recursos, Herramientas y Prompts del servidor FastMCP con el LLM local."""
 
-    def __init__(self, transport: Any = None) -> None:
+    def __init__(self, transport: Any = None, server: FastMCP | None = None) -> None:
         self._transport = transport
+        self._mcp = server or mcp_server
 
-    def obtener_estado(self) -> EstadoMcp:
-        """Indica si el SDK MCP está instalado y qué herramientas de solo lectura están registradas."""
+    async def obtener_estado(self) -> EstadoMcp:
+        """Lista herramientas, recursos y plantillas activas registradas en el servidor FastMCP."""
         sdk_disponible = importlib.util.find_spec("mcp") is not None
+        tools = await self._mcp.list_tools()
+        recursos = await self._mcp.list_resources()
+        plantillas = await self._mcp.list_resource_templates()
+        prompts = await self._mcp.list_prompts()
+
+        uris_recursos = [str(r.uri) for r in recursos] + [str(t.uriTemplate) for t in plantillas]
         return EstadoMcp(
-            habilitado=sdk_disponible,
-            herramientas_registradas=list(HERRAMIENTAS_MCP_PLANIFICADAS),
+            habilitado=sdk_disponible and len(tools) > 0,
+            transporte="fastmcp_streamable_http_y_stdio",
+            herramientas_registradas=[t.name for t in tools],
+            recursos_registrados=uris_recursos,
+            prompts_registrados=[p.name for p in prompts],
         )
 
     async def asistir_redaccion(
@@ -110,19 +125,47 @@ class McpBridgeService:
         payload: RedaccionAsistidaRequest,
         settings: Settings,
     ) -> RedaccionAsistidaResponse:
-        plantilla = PLANTILLAS_CARTAS[payload.tipo_documento]
-        ctx = payload.contexto_activo or {}
-        codigo_activo = str(payload.cod_activo or ctx.get("codigo") or "").strip() or None
-        es_nuevo_sin_anexo = payload.tipo_documento == "SOLICITUD_NUEVO_ACTIVO"
-        incluye_anexo = bool(codigo_activo and ctx and not es_nuevo_sin_anexo)
-
-        destinatario = (payload.destinatario_nombre or plantilla.destinatario_default).strip()
-        destinatario_cargo = (
-            payload.destinatario_cargo or plantilla.cargo_destinatario_default
+        plantilla = _extraer_json_recurso_mcp(
+            await self._mcp.read_resource(f"uagrm://normativa/plantilla/{payload.tipo_documento}")
+        )
+        normas = [str(n) for n in plantilla.get("normas", [])]
+        referencia_base = str(
+            plantilla.get("referencia_base") or "SOLICITUD ADMINISTRATIVA DE ACTIVO FIJO"
+        )
+        destinatario = (
+            payload.destinatario_nombre
+            or str(plantilla.get("destinatario_default") or "Jefatura del Departamento de Activos Fijos")
         ).strip()
+        destinatario_cargo = (
+            payload.destinatario_cargo
+            or str(plantilla.get("cargo_destinatario_default") or "DUAF — UAGRM")
+        ).strip()
+
+        es_nuevo_sin_anexo = payload.tipo_documento == "SOLICITUD_NUEVO_ACTIVO"
+        ctx_raw = payload.contexto_activo or {}
+        cod_inicial = str(payload.cod_activo or ctx_raw.get("codigo") or "").strip()
+
+        ficha_mcp: dict[str, Any] = {}
+        if not es_nuevo_sin_anexo and (cod_inicial or ctx_raw):
+            res_ficha = await self._mcp.call_tool(
+                "consultar_ficha_activo",
+                {
+                    "cod_activo": cod_inicial,
+                    "contexto_activo": ctx_raw,
+                    "sanitizar_publico": payload.modo_acceso == "PUBLICO_HOME",
+                },
+            )
+            ficha_mcp = _extraer_dict_tool_mcp(res_ficha)
+
+        codigo_activo = str(ficha_mcp.get("codigo") or "").strip() or None
+        ctx_verificado = (
+            ficha_mcp.get("recurso_activo_mcp")
+            if isinstance(ficha_mcp.get("recurso_activo_mcp"), dict)
+            else {}
+        )
+        incluye_anexo = bool(codigo_activo and ctx_verificado and not es_nuevo_sin_anexo)
         lugar_fecha = _fecha_bolivia_formal()
 
-        # Intentar redacción vía LLM local personalizado (uagrm-activo-fijo) con anclaje MCP
         recurso_mcp = {
             "tipo_documento": payload.tipo_documento,
             "modo_acceso": payload.modo_acceso,
@@ -132,25 +175,18 @@ class McpBridgeService:
                 "cargo": payload.solicitante_cargo or "Funcionario Institucional",
                 "unidad": payload.solicitante_unidad or "Unidad Universitaria UAGRM",
             },
-            "normativa_aplicable": list(plantilla.normas),
-            "recurso_activo_mcp": ctx if not es_nuevo_sin_anexo else None,
+            "normativa_aplicable": normas,
+            "recurso_activo_mcp": ctx_verificado if not es_nuevo_sin_anexo else None,
         }
 
-        prompt_usuario = (
-            "Redacta el cuerpo epistolar de una carta formal UAGRM en español de Bolivia "
-            "usando EXCLUSIVAMENTE los datos del Recurso MCP adjunto.\n"
-            f"Recurso MCP: {recurso_mcp}\n"
-            f"Motivo o instrucción del solicitante: {payload.instruccion_usuario}\n\n"
-            "Reglas de estilo:\n"
-            "- NO incluyas fecha, destinatario, 'Señor(a)', 'Presente' ni firma dentro de cuerpo_parrafos (el formato Word/PDF ya los agrega).\n"
-            "- Moneda oficial: Bolivianos abreviado estrictamente como 'Bs.' (NUNCA uses 'Bs.S' ni dólares).\n"
-            "- Genera exactamente 3 párrafos claros y formales en cuerpo_parrafos:\n"
-            "  1) Objeto de la solicitud y referencia a la unidad solicitante y normativa UAGRM aplicable.\n"
-            "  2) Detalle técnico del activo (si existe codigo en Recurso MCP, cítalo exacto con su descripción y monto) o especificación del requerimiento.\n"
-            "  3) Párrafo de disposición para verificación técnica/anexo y cierre cordial.\n\n"
-            "Devuelve SOLO un objeto JSON con las claves exactas:\n"
-            '{"referencia": string, "cuerpo_parrafos": [string, string, string], "despedida": string}'
+        prompt_res = await self._mcp.get_prompt(
+            "prompt_redaccion_carta_uagrm",
+            {
+                "recurso_mcp_json": json.dumps(recurso_mcp, ensure_ascii=False),
+                "instruccion_usuario": payload.instruccion_usuario,
+            },
         )
+        prompt_usuario = _extraer_texto_prompt_mcp(prompt_res)
 
         llm = OpenAICompatibleLlmClient(settings, transport=self._transport)
         advertencias: list[str] = []
@@ -172,29 +208,29 @@ class McpBridgeService:
                 )
                 datos = extraer_json_objeto(res.contenido)
                 if datos and isinstance(datos.get("cuerpo_parrafos"), list):
-                    parrafos = [
-                        re.sub(r"\bBs\.?\s*S\.?", "Bs.", str(p)).strip()
-                        for p in datos["cuerpo_parrafos"]
-                        if str(p).strip()
-                    ]
+                    validado = _extraer_dict_tool_mcp(
+                        await self._mcp.call_tool(
+                            "validar_integridad_texto",
+                            {
+                                "cuerpo_parrafos": [str(p) for p in datos["cuerpo_parrafos"]],
+                                "contexto_activo": ctx_verificado,
+                                "cod_activo": codigo_activo,
+                                "es_nuevo_sin_anexo": es_nuevo_sin_anexo,
+                            },
+                        )
+                    )
+                    parrafos = [str(p) for p in validado.get("cuerpo_parrafos", []) if str(p).strip()]
+                    advertencias.extend(str(a) for a in validado.get("advertencias", []))
                     if parrafos:
-                        referencia = str(datos.get("referencia") or plantilla.referencia_base).strip()
-                        despedida = str(
-                            datos.get("despedida")
-                            or "Con este motivo, saludo a usted con las consideraciones más distinguidas."
-                        ).strip()
-
-                        # Validador MCP Anti-Alucinación: asegura cita exacta del código de activo si existe
-                        texto_unido = " ".join(parrafos)
-                        if codigo_activo and not es_nuevo_sin_anexo and codigo_activo not in texto_unido:
-                            parrafos.insert(
-                                1,
-                                self._construir_parrafo_respaldo_activo(ctx, codigo_activo),
+                        referencia = normalizar_moneda_texto(
+                            str(datos.get("referencia") or referencia_base)
+                        )
+                        despedida = normalizar_moneda_texto(
+                            str(
+                                datos.get("despedida")
+                                or "Con este motivo, saludo a usted con las consideraciones más distinguidas."
                             )
-                            advertencias.append(
-                                "El validador MCP insertó automáticamente la referencia exacta del activo para evitar omisiones."
-                            )
-
+                        )
                         motor_id, _ = _resolver_motor(settings)
                         return RedaccionAsistidaResponse(
                             motor_utilizado=motor_id,  # type: ignore[arg-type]
@@ -206,7 +242,7 @@ class McpBridgeService:
                             cuerpo_parrafos=parrafos,
                             despedida=despedida,
                             incluye_anexo_tecnico=incluye_anexo,
-                            fundamento_normativo=list(plantilla.normas),
+                            fundamento_normativo=normas,
                             advertencias=advertencias,
                             tokens_usados=res.tokens_usados,
                         )
@@ -215,15 +251,16 @@ class McpBridgeService:
                     "Modelo Ollama local no disponible en este instante; borrador generado mediante motor normativo determinista MCP."
                 )
 
-        # Respaldo determinista institucional 100% garantizado
-        parrafos_det = self._redactar_determinista(payload, plantilla.referencia_base, ctx, codigo_activo, incluye_anexo)
+        parrafos_det = self._redactar_determinista(
+            payload, ctx_verificado, codigo_activo, incluye_anexo
+        )
         return RedaccionAsistidaResponse(
             motor_utilizado="respaldo_determinista",
             modelo=f"{settings.llm_model} (respaldo-determinista)",
             referencia=(
-                f"{plantilla.referencia_base} — {codigo_activo}"
+                f"{referencia_base} — {codigo_activo}"
                 if codigo_activo and not es_nuevo_sin_anexo
-                else plantilla.referencia_base
+                else referencia_base
             ),
             lugar_fecha=lugar_fecha,
             destinatario_nombre=destinatario,
@@ -234,30 +271,14 @@ class McpBridgeService:
                 "me despido con las consideraciones más distinguidas."
             ),
             incluye_anexo_tecnico=incluye_anexo,
-            fundamento_normativo=list(plantilla.normas),
+            fundamento_normativo=normas,
             advertencias=advertencias,
             tokens_usados=0,
-        )
-
-    def _construir_parrafo_respaldo_activo(self, ctx: dict[str, Any], codigo: str) -> str:
-        desc = str(ctx.get("descripcion") or "Bien patrimonial universitario").strip()
-        ubicacion = str(
-            (ctx.get("asignacion") or {}).get("ubicacion", {}).get("oficina")
-            or ctx.get("ubicacion")
-            or "dependencia universitaria asignada"
-        ).strip()
-        costo = _formatear_bs(ctx.get("costo") if ctx.get("costo") is not None else ctx.get("valor"))
-        estado = str(ctx.get("estado") or "ACTIVO").strip()
-        return (
-            f"El bien objeto de la presente solicitud corresponde al código patrimonial {codigo} "
-            f"({desc}), registrado actualmente en {ubicacion}, en estado operativo {estado} "
-            f"con valor contable de {costo}."
         )
 
     def _redactar_determinista(
         self,
         payload: RedaccionAsistidaRequest,
-        _referencia: str,
         ctx: dict[str, Any],
         codigo: str | None,
         incluye_anexo: bool,
@@ -326,11 +347,9 @@ class McpBridgeService:
         ]
 
         if codigo and ctx:
-            parrafos.append(self._construir_parrafo_respaldo_activo(ctx, codigo))
+            parrafos.append(construir_parrafo_respaldo_activo(ctx, codigo))
         elif codigo:
-            parrafos.append(
-                f"El trámite comprende al bien patrimonial identificado con el código {codigo}."
-            )
+            parrafos.append(f"El trámite comprende al bien patrimonial identificado con el código {codigo}.")
 
         cierre = (
             "Se adjunta como Anexo en la página siguiente el Informe Técnico oficial extraído del padrón institucional "
@@ -346,35 +365,51 @@ class McpBridgeService:
         payload: ConsultaLenguajeNaturalRequest,
         settings: Settings,
     ) -> ConsultaLenguajeNaturalResponse:
-        filtros_det = self._extraer_filtros_deterministas(payload.consulta_usuario)
+        filtros_dict = _extraer_dict_tool_mcp(
+            await self._mcp.call_tool(
+                "filtrar_catalogo_reportes", {"consulta_usuario": payload.consulta_usuario}
+            )
+        )
+        filtros_det = FiltrosDetectadosReporte(**filtros_dict)
+
         lote = payload.resumen_lote
         resumen_ej: str | None = None
         hallazgos: list[str] = []
         advertencias: list[str] = []
 
         if lote is not None:
-            resumen_ej, hallazgos = self._construir_resumen_ejecutivo_lote(lote)
+            lote_res = _extraer_dict_tool_mcp(
+                await self._mcp.call_tool(
+                    "resumir_lote_patrimonial",
+                    {
+                        "titulo_reporte": lote.titulo_reporte,
+                        "total_registros": lote.total_registros,
+                        "valor_total_bs": lote.valor_total_bs,
+                        "estados": lote.estados,
+                        "grupos_top": lote.grupos_top,
+                        "criterios_aplicados": lote.criterios_aplicados,
+                    },
+                )
+            )
+            resumen_ej = lote_res.get("resumen_ejecutivo")
+            hallazgos = [str(h) for h in lote_res.get("hallazgos_clave", [])]
 
         llm = OpenAICompatibleLlmClient(settings, transport=self._transport)
-        motor_usado = "respaldo_determinista"
-        modelo_usado = f"{settings.llm_model} (respaldo-determinista)"
-        tokens = 0
-
         if (payload.consulta_usuario.strip() or lote is not None) and (
             settings.env != "test" or self._transport is not None
         ):
             try:
-                prompt = (
-                    "Eres un intérprete de consultas MCP y analista patrimonial de la UAGRM.\n"
-                    f"Módulo: {payload.contexto_modulo}\n"
-                    f"Consulta en lenguaje natural: {payload.consulta_usuario or 'Sin filtro adicional'}\n"
-                    f"Resumen real del lote (JSON): {lote.model_dump() if lote else None}\n\n"
-                    "Devuelve SOLO JSON con estas claves:\n"
-                    '{"filtros": {"search": str|null, "estado": "ACTIVO"|"ASIGNADO"|"BAJA"|null, '
-                    '"condicion": "BUENO"|"REGULAR"|"MALO"|null, "grupo_contable": str|null, '
-                    '"ubicacion": str|null, "valor_min": float|null, "valor_max": float|null, "gestion": int|null}, '
-                    '"explicacion": str, "resumen_ejecutivo": str|null, "hallazgos_clave": [str]}'
+                prompt_res = await self._mcp.get_prompt(
+                    "prompt_interpretar_reporte_uagrm",
+                    {
+                        "contexto_modulo": payload.contexto_modulo,
+                        "consulta_usuario": payload.consulta_usuario,
+                        "resumen_lote_json": json.dumps(lote.model_dump(), ensure_ascii=False)
+                        if lote
+                        else "null",
+                    },
                 )
+                prompt = _extraer_texto_prompt_mcp(prompt_res)
                 res = await llm.generar_chat_completado(
                     mensajes=[
                         {
@@ -391,13 +426,19 @@ class McpBridgeService:
                     if isinstance(raw_f, dict):
                         filtros_det = self._combinar_filtros(filtros_det, raw_f)
                     if isinstance(parsed.get("resumen_ejecutivo"), str) and parsed["resumen_ejecutivo"].strip():
-                        # Validar que mencione cifras reales del lote para prevenir alucinaciones
-                        texto_res = parsed["resumen_ejecutivo"].strip()
+                        texto_res = normalizar_moneda_texto(parsed["resumen_ejecutivo"])
                         if lote is None or str(lote.total_registros) in texto_res:
                             resumen_ej = texto_res
                     if isinstance(parsed.get("hallazgos_clave"), list) and parsed["hallazgos_clave"]:
-                        hallazgos = [str(h).strip() for h in parsed["hallazgos_clave"][:4] if str(h).strip()]
-                    explicacion = str(parsed.get("explicacion") or "").strip() or self._explicar_filtros(filtros_det)
+                        hallazgos = [
+                            normalizar_moneda_texto(str(h))
+                            for h in parsed["hallazgos_clave"][:4]
+                            if str(h).strip()
+                        ]
+                    explicacion = (
+                        normalizar_moneda_texto(str(parsed.get("explicacion") or ""))
+                        or self._explicar_filtros(filtros_det)
+                    )
                     motor_id, _ = _resolver_motor(settings)
                     return ConsultaLenguajeNaturalResponse(
                         motor_utilizado=motor_id,  # type: ignore[arg-type]
@@ -413,82 +454,14 @@ class McpBridgeService:
                 advertencias.append("Intérprete ejecutado en modo determinista local MCP.")
 
         return ConsultaLenguajeNaturalResponse(
-            motor_utilizado=motor_usado,  # type: ignore[arg-type]
-            modelo=modelo_usado,
+            motor_utilizado="respaldo_determinista",
+            modelo=f"{settings.llm_model} (respaldo-determinista)",
             filtros_detectados=filtros_det,
             explicacion=self._explicar_filtros(filtros_det),
             resumen_ejecutivo=resumen_ej,
             hallazgos_clave=hallazgos,
             advertencias=advertencias,
-            tokens_usados=tokens,
-        )
-
-    def _extraer_filtros_deterministas(self, consulta: str) -> FiltrosDetectadosReporte:
-        norm = _normalizar_texto(consulta)
-        if not norm:
-            return FiltrosDetectadosReporte()
-
-        estado: str | None = None
-        if "baja" in norm or "desincorporad" in norm:
-            estado = "BAJA"
-        elif "asignad" in norm or "custodia" in norm:
-            estado = "ASIGNADO"
-        elif "activ" in norm and "activo fijo" not in norm:
-            estado = "ACTIVO"
-
-        condicion: str | None = None
-        if "malo" in norm or "inutilizad" in norm or "deteriorad" in norm or "dañad" in norm:
-            condicion = "MALO"
-        elif "regular" in norm:
-            condicion = "REGULAR"
-        elif "bueno" in norm or "optimo" in norm:
-            condicion = "BUENO"
-
-        grupo: str | None = None
-        if any(p in norm for p in ("comput", "laptop", "pc", "servidor", "impresora", "monitor")):
-            grupo = "EQUIPOS DE COMPUTACIÓN"
-        elif any(p in norm for p in ("muebl", "escritorio", "silla", "estante", "mesa")):
-            grupo = "MUEBLES Y ENSERES"
-        elif any(p in norm for p in ("vehic", "camioneta", "auto", "bus")):
-            grupo = "VEHÍCULOS"
-        elif any(p in norm for p in ("laboratorio", "microscopio", "equipo medico")):
-            grupo = "EQUIPOS DE LABORATORIO"
-
-        ubicacion: str | None = None
-        for sigla in ("ficct", "decanato", "biblioteca", "rectorado", "auditorio", "duaf", "postgrado"):
-            if sigla in norm:
-                ubicacion = sigla.upper()
-                break
-
-        valor_min: float | None = None
-        valor_max: float | None = None
-        m_min = re.search(r"(?:mayor(?:es)?\s*(?:a|que|de)|desd?e\s*bs\.?|>=?)\s*(\d+(?:[.,]\d+)?)", norm)
-        if m_min:
-            valor_min = float(m_min.group(1).replace(",", "."))
-        m_max = re.search(r"(?:menor(?:es)?\s*(?:a|que|de)|hasta\s*bs\.?|<=?)\s*(\d+(?:[.,]\d+)?)", norm)
-        if m_max:
-            valor_max = float(m_max.group(1).replace(",", "."))
-
-        gestion: int | None = None
-        m_anio = re.search(r"\b(20\d{2})\b", norm)
-        if m_anio:
-            gestion = int(m_anio.group(1))
-
-        # Si hay código patrimonial explícito (ej. U04000018 o 4300-01-0001)
-        search: str | None = None
-        m_cod = re.search(r"\b([a-z]\d{6,10}|\d{4}-\d{2}-\d{3,6})\b", consulta, flags=re.IGNORECASE)
-        if m_cod:
-            search = m_cod.group(1).upper()
-
-        return FiltrosDetectadosReporte(
-            search=search,
-            estado=estado,
-            condicion=condicion,
-            grupo_contable=grupo,
-            ubicacion=ubicacion,
-            valor_min=valor_min,
-            valor_max=valor_max,
-            gestion=gestion,
+            tokens_usados=0,
         )
 
     def _combinar_filtros(
@@ -528,107 +501,55 @@ class McpBridgeService:
             return "Se analizará el lote actual completo sin restricciones adicionales."
         return "Filtros MCP interpretados: " + ", ".join(partes) + "."
 
-    def _construir_resumen_ejecutivo_lote(self, lote: Any) -> tuple[str, list[str]]:
-        total = int(lote.total_registros)
-        monto = _formatear_bs(lote.valor_total_bs)
-        estados_texto = ", ".join(f"{k}: {v}" for k, v in (lote.estados or {}).items())
-        resumen = (
-            f"El reporte consolidado «{lote.titulo_reporte}» comprende {total} registro(s) auditado(s) "
-            f"con un valor patrimonial acumulado de {monto}."
-            + (f" Distribución por estado: {estados_texto}." if estados_texto else "")
-        )
-        hallazgos: list[str] = [
-            f"Cobertura total analizada: {total} registro(s) por un monto acumulado de {monto}.",
-        ]
-        for grp in (lote.grupos_top or [])[:2]:
-            nombre = grp.get("nombre") or "Grupo principal"
-            cnt = grp.get("cantidad") or 0
-            hallazgos.append(f"Concentración destacada en {nombre}: {cnt} registro(s).")
-        if lote.criterios_aplicados:
-            hallazgos.append("Criterios activos: " + " | ".join(lote.criterios_aplicados[:3]))
-        return resumen, hallazgos
-
-    def _es_pregunta_fuera_de_ambito(self, pregunta_norm: str) -> bool:
-        if any(p in pregunta_norm for p in PALABRAS_BLOQUEO_EXTERNO):
-            return True
-        if len(pregunta_norm) <= 3:
-            return False
-        tiene_termino_dominio = any(p in pregunta_norm for p in PALABRAS_DOMINIO_VALIDO)
-        return not tiene_termino_dominio and len(pregunta_norm.split()) >= 5
-
-    def _rutas_permitidas(self, payload: AyudaSistemaRequest) -> list[RutaSistemaGuia]:
-        return [
-            r
-            for r in GUIA_RUTAS_SISTEMA
-            if _tiene_permiso(r.permiso_requerido, payload.permisos_usuario, payload.rol_usuario)
-        ]
-
     async def responder_ayuda_sistema(
         self,
         payload: AyudaSistemaRequest,
         settings: Settings,
     ) -> AyudaSistemaResponse:
-        pregunta_norm = _normalizar_texto(payload.pregunta)
-        rutas_disponibles = self._rutas_permitidas(payload)
+        guia_mcp = _extraer_dict_tool_mcp(
+            await self._mcp.call_tool(
+                "consultar_guia_sistema",
+                {
+                    "pregunta": payload.pregunta,
+                    "rol_usuario": payload.rol_usuario,
+                    "permisos_usuario": payload.permisos_usuario,
+                },
+            )
+        )
 
-        if self._es_pregunta_fuera_de_ambito(pregunta_norm):
+        if guia_mcp.get("fuera_de_ambito"):
             return AyudaSistemaResponse(
                 motor_utilizado="respaldo_determinista",
                 modelo=settings.llm_model,
-                respuesta=(
-                    "Soy el Asistente Especializado del Sistema de Activos Fijos de la UAGRM. "
-                    "Por política institucional solo respondo consultas sobre el manejo de esta plataforma, "
-                    "sus formularios, actas, trazabilidad o normativas vigentes."
-                ),
-                pasos=[
-                    "Pregúntame dónde encontrar un formulario (ej. baja, asignación o corrección).",
-                    "Consulta cómo funciona el Motor Normativo, Random Forest o cómo cambiar tu contraseña y 2FA.",
-                ],
+                respuesta=str(guia_mcp.get("respuesta_base") or ""),
+                pasos=[str(p) for p in guia_mcp.get("pasos_base", [])],
                 enlaces_directos=[],
                 fuera_de_ambito=True,
                 tokens_usados=0,
             )
 
-        # Seleccionar enlaces relevantes según palabras clave y permisos RBAC reales
-        coincidencias: list[tuple[int, RutaSistemaGuia]] = []
-        for ruta in rutas_disponibles:
-            puntaje = sum(1 for kw in ruta.palabras_clave if kw in pregunta_norm)
-            if puntaje > 0:
-                coincidencias.append((puntaje, ruta))
-        coincidencias.sort(key=lambda item: item[0], reverse=True)
-        rutas_sugeridas = [item[1] for item in coincidencias[:3]]
-
-        if "baja" in pregunta_norm and not any(r.ruta == "/formularios/baja" for r in rutas_disponibles):
-            doc_ruta = next((r for r in rutas_disponibles if r.ruta == "/gestion-documental"), None)
-            if doc_ruta and all(r.ruta != "/gestion-documental" for r in rutas_sugeridas):
-                rutas_sugeridas.insert(0, doc_ruta)
-                rutas_sugeridas = rutas_sugeridas[:3]
-
         enlaces = [
-            EnlaceDirectoSistema(titulo=r.titulo, ruta=r.ruta, descripcion=r.descripcion)
-            for r in rutas_sugeridas
+            EnlaceDirectoSistema(**item)
+            for item in guia_mcp.get("enlaces_directos", [])
+            if isinstance(item, dict)
         ]
-
-        # Respuesta determinista de base (alta precisión y siempre disponible)
-        respuesta_det, pasos_det = self._construir_respuesta_ayuda_determinista(
-            pregunta_norm, rutas_sugeridas, payload
-        )
+        respuesta_det = str(guia_mcp.get("respuesta_base") or "")
+        pasos_det = [str(p) for p in guia_mcp.get("pasos_base", [])]
+        catalogo_permitido = guia_mcp.get("catalogo_permitido", [])
 
         llm = OpenAICompatibleLlmClient(settings, transport=self._transport)
         if settings.env != "test" or self._transport is not None:
             try:
-                catalogo_permitido = [
-                    {"titulo": r.titulo, "ruta": r.ruta, "guia": r.guia_breve}
-                    for r in (rutas_sugeridas or rutas_disponibles[:6])
-                ]
-                prompt = (
-                    f"Rol del usuario: {payload.rol_usuario} | Ruta actual: {payload.ruta_actual}\n"
-                    f"Módulos permitidos para este usuario (MCP): {catalogo_permitido}\n"
-                    f"Pregunta del usuario: {payload.pregunta}\n\n"
-                    "Responde en español claro y conciso guiando al usuario dentro del sistema UAGRM. "
-                    "Devuelve SOLO JSON: "
-                    '{"respuesta": string, "pasos": [string, string], "fuera_de_ambito": false}'
+                prompt_res = await self._mcp.get_prompt(
+                    "prompt_asistente_sistema_uagrm",
+                    {
+                        "rol_usuario": payload.rol_usuario,
+                        "ruta_actual": payload.ruta_actual,
+                        "catalogo_permitido_json": json.dumps(catalogo_permitido, ensure_ascii=False),
+                        "pregunta": payload.pregunta,
+                    },
                 )
+                prompt = _extraer_texto_prompt_mcp(prompt_res)
                 res = await llm.generar_chat_completado(
                     mensajes=[
                         {
@@ -645,7 +566,7 @@ class McpBridgeService:
                 parsed = extraer_json_objeto(res.contenido)
                 if parsed and isinstance(parsed.get("respuesta"), str) and parsed["respuesta"].strip():
                     pasos_llm = [
-                        str(p).strip()
+                        normalizar_moneda_texto(str(p))
                         for p in (parsed.get("pasos") or [])
                         if str(p).strip()
                     ][:4]
@@ -653,7 +574,7 @@ class McpBridgeService:
                     return AyudaSistemaResponse(
                         motor_utilizado=motor_id,  # type: ignore[arg-type]
                         modelo=res.modelo,
-                        respuesta=parsed["respuesta"].strip(),
+                        respuesta=normalizar_moneda_texto(parsed["respuesta"]),
                         pasos=pasos_llm or pasos_det,
                         enlaces_directos=enlaces,
                         fuera_de_ambito=bool(parsed.get("fuera_de_ambito", False)),
@@ -670,55 +591,4 @@ class McpBridgeService:
             enlaces_directos=enlaces,
             fuera_de_ambito=False,
             tokens_usados=0,
-        )
-
-    def _construir_respuesta_ayuda_determinista(
-        self,
-        pregunta_norm: str,
-        rutas_sugeridas: list[RutaSistemaGuia],
-        payload: AyudaSistemaRequest,
-    ) -> tuple[str, list[str]]:
-        if any(p in pregunta_norm for p in ("contraseña", "contrasena", "password", "2fa", "totp", "autenticador")):
-            return (
-                "Puede cambiar su contraseña institucional y gestionar su verificación en dos pasos (2FA TOTP) desde Seguridad de Cuenta.",
-                [
-                    "Haga clic en el botón 'Seguridad de Cuenta' de abajo (o en su perfil al pie del menú lateral).",
-                    "Ingrese a la pestaña de contraseña o verificación 2FA y guarde los cambios.",
-                ],
-            )
-
-        if "priorizacion" in pregunta_norm or "normativa" in pregunta_norm:
-            return (
-                "La priorización normativa evalúa cada bien con reglas deterministas basadas en la R.R. N° 449/2013 (bajas), R.R. N° 567/2018 (revalúo) y D.S. 24051.",
-                [
-                    "Activos con valor residual cercano a Bs 1,00 pero estado físico Bueno o Regular se sugieren para Revalúo Técnico.",
-                    "Activos en estado Malo o Inutilizado con desgaste severo se clasifican como candidatos a Baja Patrimonial.",
-                ],
-            )
-
-        if "baja" in pregunta_norm and not any(r.ruta == "/formularios/baja" for r in self._rutas_permitidas(payload)):
-            return (
-                "Su perfil de funcionario no registra bajas directas en inventario, pero sí puede emitir una Carta Formal de Solicitud de Baja hacia Activo Fijo.",
-                [
-                    "Abra 'Documentos y Actas' mediante el acceso directo de abajo.",
-                    "Haga clic en 'Redactar Carta IA', seleccione el activo deteriorado y descargue su carta en Word o PDF para remitirla.",
-                ],
-            )
-
-        if rutas_sugeridas:
-            principal = rutas_sugeridas[0]
-            return (
-                principal.guia_breve,
-                [
-                    f"Use el acceso directo '{principal.titulo}' mostrado abajo.",
-                    "Complete los campos o filtros requeridos en la pantalla correspondiente.",
-                ],
-            )
-
-        return (
-            "Puedo ayudarle a ubicar cualquier formulario del sistema, redactar cartas de solicitud/corrección, generar reportes IA o consultar normativas UAGRM.",
-            [
-                "Consulte por ejemplo: '¿Dónde está el formulario de baja?', '¿Cómo cambio mi contraseña?' o '¿Cómo redacto una carta de corrección?'.",
-                "También puede usar el botón de micrófono para dictar su consulta por voz.",
-            ],
         )

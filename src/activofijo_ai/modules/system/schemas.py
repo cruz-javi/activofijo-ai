@@ -27,7 +27,10 @@ class EstadoProveedorLlm(BaseModel):
 
 class EstadoMcp(BaseModel):
     habilitado: bool
+    transporte: str = "fastmcp_streamable_http_y_stdio"
     herramientas_registradas: list[str]
+    recursos_registrados: list[str] = Field(default_factory=list)
+    prompts_registrados: list[str] = Field(default_factory=list)
 
 
 class EstadoServicioIaResponse(BaseModel):
