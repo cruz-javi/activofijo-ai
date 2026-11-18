@@ -152,8 +152,8 @@ def test_interpretar_consulta_y_resumen_ejecutivo_lote(tmp_path: Path) -> None:
     assert resp.status_code == 200
     body = resp.json()
     filtros = body["filtros_detectados"]
-    assert filtros["grupo_contable"] == "EQUIPOS DE COMPUTACIÓN"
-    assert filtros["condicion"] == "MALO"
+    assert filtros["grupo_contable"] == "Equipos de Computación"
+    assert filtros["estado"] == "MALO"
     assert filtros["ubicacion"] == "FICCT"
     assert filtros["valor_min"] == 3000.0
     assert filtros["gestion"] == 2022
@@ -299,8 +299,8 @@ def test_endpoint_jsonrpc_streamable_http_mcp_protegido(tmp_path: Path) -> None:
         )
         assert auth_call.status_code == 200
         call_result = auth_call.json()["result"]
-        assert call_result["structuredContent"]["grupo_contable"] == "VEHÍCULOS"
-        assert call_result["structuredContent"]["condicion"] == "MALO"
+        assert call_result["structuredContent"]["grupo_contable"] == "Vehículos"
+        assert call_result["structuredContent"]["estado"] == "MALO"
         assert call_result["structuredContent"]["ubicacion"] == "FICCT"
 
 
@@ -467,35 +467,76 @@ def test_sesion_temporal_hereda_filtros_reporte_y_refina_carta(tmp_path: Path) -
     client = _crear_cliente(tmp_path)
     headers = {"X-AI-Internal-Key": CLAVE_TEST}
 
-    # Refinamiento de reporte en sesión temporal hereda condición previa y añade unidad
+    # Refinamiento de reporte en sesión temporal hereda estado previo y añade unidad
     res_rep = client.post(
         "/v1/llm/consulta-analitica",
         headers=headers,
         json={
-            "consulta": "fíltralo ahora solo para FICCT",
+            "consulta": "fíltralo ahora solo para FICCT y expórtalo en pdf, excel y word con graficas",
             "modulo": "reportes",
             "historial": [
                 {"rol": "usuario", "texto": "Activos en estado malo"},
                 {"rol": "asistente", "texto": "Padrón consultado en estado malo."},
             ],
             "reporte_previo": {
-                "filtros_detectados": {"condicion": "MALO"},
-                "resumen_ejecutivo": "Se encontraron bienes en condición MALO.",
+                "filtros_detectados": {"estado": "MALO"},
+                "resumen_ejecutivo": "Se encontraron bienes en estado MALO.",
             },
         },
     )
     assert res_rep.status_code == 200
-    filtros = res_rep.json()["filtros_detectados"]
-    assert filtros["condicion"] == "MALO"
+    body_rep = res_rep.json()
+    filtros = body_rep["filtros_detectados"]
+    assert filtros["estado"] == "MALO"
     assert filtros["ubicacion"] == "FICCT"
+    assert body_rep["formatos_exportacion"] == ["pdf", "excel", "word"]
+    assert body_rep["incluir_graficas"] is True
 
-    # Refinamiento de carta preserva destinatario previo en sesión temporal
+    # Consulta sin solicitud explícita de exportación/gráficas -> listas vacías y gráficas en False
+    res_rep_simple = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "bienes en reparacion deteriorados de Veterinarias entre 2.000 y 10.000 bs",
+            "modulo": "reportes",
+        },
+    )
+    assert res_rep_simple.status_code == 200
+    body_simple = res_rep_simple.json()
+    assert body_simple["filtros_detectados"]["estado"] == "EN_REPARACION"
+    assert body_simple["filtros_detectados"]["condicion"] == "DETERIORADO"
+    assert body_simple["filtros_detectados"]["ubicacion"] == "Veterinarias"
+    assert body_simple["filtros_detectados"]["valor_min"] == 2000.0
+    assert body_simple["filtros_detectados"]["valor_max"] == 10000.0
+    assert body_simple["formatos_exportacion"] == []
+    assert body_simple["incluir_graficas"] is False
+
+    # Redacción extensa (5 párrafos), destinatario implícito y exportación Word/PDF explícita
+    res_nueva_carta = client.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "instruccion_usuario": (
+                "solicito dotacion de equipo laboratorio dirigida a Ing. Roberto Paz, Director Administrativo DUAF "
+                "para el centro de computo y exportar en word"
+            ),
+            "solicitante_unidad": "FICCT",
+        },
+    )
+    assert res_nueva_carta.status_code == 200
+    body_nueva = res_nueva_carta.json()
+    assert body_nueva["tipo_documento_detectado"] == "SOLICITUD_NUEVO_ACTIVO"
+    assert len(body_nueva["cuerpo_parrafos"]) == 5
+    assert body_nueva["destinatario_nombre"] == "Ing. Roberto Paz"
+    assert body_nueva["exportacion_solicitada"] == ["word"]
+
+    # Refinamiento quirúrgico de carta preserva destinatario y párrafos no tocados en sesión temporal
     res_carta = client.post(
         "/v1/llm/asistir-redaccion",
         headers=headers,
         json={
             "tipo_documento": "SOLICITUD_BAJA",
-            "instruccion_usuario": "Aclara que la falla ocurrió por sobrecarga eléctrica.",
+            "instruccion_usuario": "Modifica el parrafo 2 aclarando sobrecarga electrica.",
             "historial": [
                 {"rol": "usuario", "texto": "Solicitar baja de proyector"},
                 {"rol": "asistente", "texto": "SOLICITUD DE BAJA"},
@@ -504,7 +545,7 @@ def test_sesion_temporal_hereda_filtros_reporte_y_refina_carta(tmp_path: Path) -
                 "referencia": "SOLICITUD DE BAJA — U04000018",
                 "destinatario_nombre": "Ing. Carlos Méndez",
                 "destinatario_cargo": "Decano FICCT",
-                "cuerpo_parrafos": ["Párrafo inicial de prueba."],
+                "cuerpo_parrafos": ["Párrafo inicial de prueba.", "Segundo párrafo técnico."],
             },
         },
     )
@@ -512,3 +553,22 @@ def test_sesion_temporal_hereda_filtros_reporte_y_refina_carta(tmp_path: Path) -
     body_carta = res_carta.json()
     assert body_carta["destinatario_nombre"] == "Ing. Carlos Méndez"
     assert body_carta["destinatario_cargo"] == "Decano FICCT"
+    assert body_carta["cuerpo_parrafos"][0] == "Párrafo inicial de prueba."
+    assert "sobrecarga electrica" in body_carta["cuerpo_parrafos"][1].lower()
+
+    # Ayuda IA cuantitativa consulta padrón real y multi-rol admin
+    res_ayuda_cnt = client.post(
+        "/v1/llm/asistente-sistema",
+        headers=headers,
+        json={
+            "pregunta": "¿Cuántos equipos en estado malo hay en FICCT?",
+            "ruta_actual": "/activos",
+            "rol_usuario": "FUNCIONARIO, ADMINISTRADOR",
+            "permisos_usuario": ["activos:consultar"],
+        },
+    )
+    assert res_ayuda_cnt.status_code == 200
+    body_ayuda_cnt = res_ayuda_cnt.json()
+    assert any(t["herramienta"] == "buscar_activos_padron" for t in body_ayuda_cnt["trazas_mcp"])
+    assert "buscar_activos_padron" not in body_ayuda_cnt["respuesta"]
+    assert any(l["ruta"] == "/usuarios" for l in body_ayuda_cnt["enlaces_directos"]) or body_ayuda_cnt["enlaces_directos"] is not None

@@ -76,6 +76,7 @@ class RedaccionAsistidaResponse(BaseModel):
     fundamento_normativo: list[str] = Field(default_factory=list)
     advertencias: list[str] = Field(default_factory=list)
     trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
+    exportacion_solicitada: list[Literal["word", "pdf"]] = Field(default_factory=list)
     tokens_usados: int = 0
 
 
@@ -169,6 +170,8 @@ class ConsultaAnaliticaResponse(BaseModel):
     activos_mencionados: list[dict[str, Any]] = Field(default_factory=list)
     estadisticas: dict[str, Any] | None = None
     trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
+    formatos_exportacion: list[Literal["pdf", "excel", "word"]] = Field(default_factory=list)
+    incluir_graficas: bool = False
     fuera_de_ambito: bool = False
     tokens_usados: int = 0
 

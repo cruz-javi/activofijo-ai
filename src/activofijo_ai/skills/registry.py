@@ -32,18 +32,6 @@ _CATALOGO_DEFINIDO: tuple[tuple[str, SuperficieIa, str, str], ...] = (
         "Interpretación de Voz en Inspección Móvil",
         "movil/inspeccion_voz.md",
     ),
-    (
-        "vision_etiquetas",
-        "movil",
-        "Visión y Desambiguación de Etiquetas",
-        "movil/vision_etiquetas.md",
-    ),
-    (
-        "conciliacion_campo",
-        "movil",
-        "Conciliación Física en Campo",
-        "movil/conciliacion_campo.md",
-    ),
 )
 
 

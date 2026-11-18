@@ -11,12 +11,11 @@ def test_registro_skills_movil_aislado_y_compacto() -> None:
     catalogo = cargar_catalogo_skills()
     assert "reglas_generales" in catalogo
     assert "inspeccion_voz" in catalogo
-    assert "vision_etiquetas" in catalogo
-    assert "conciliacion_campo" in catalogo
+    assert set(catalogo.keys()) == {"reglas_generales", "inspeccion_voz"}
 
     movil = listar_skills("movil")
     ids_movil = {s.identificador for s in movil}
-    assert ids_movil == {"inspeccion_voz", "vision_etiquetas", "conciliacion_campo"}
+    assert ids_movil == {"inspeccion_voz"}
 
     prompt = construir_instruccion_sistema("movil", ("inspeccion_voz",))
     assert "Filtro de voz para inspección física" in prompt

@@ -115,10 +115,15 @@ def tiene_permiso_rbac(
     permisos_usuario: list[str],
     rol: str,
 ) -> bool:
-    """Evalúa permisos efectivos respetando privilegios RBAC del usuario."""
+    """Evalúa permisos efectivos respetando privilegios RBAC del usuario (multi-rol)."""
     if permiso_requerido is None:
         return True
-    if rol.upper() in {"ADMINISTRADOR", "SUPER_ADMIN", "ADMIN"}:
+    roles_tokens = [
+        tok.strip().upper()
+        for tok in re.split(r"[,;\s]+", rol or "")
+        if tok.strip()
+    ]
+    if any(r in {"ADMINISTRADOR", "SUPER_ADMIN", "ADMIN"} for r in roles_tokens):
         return True
     return permiso_requerido in permisos_usuario
 
@@ -220,8 +225,99 @@ def consultar_reglas_normativas(tipo_documento: str) -> dict[str, Any]:
     return json.loads(recurso_plantilla_documento(tipo_documento))
 
 
+ESTADOS_PADRON_VALIDOS: frozenset[str] = frozenset(
+    {"BUENO", "REGULAR", "MALO", "EN_REPARACION", "BAJA", "ACTIVO", "ASIGNADO"}
+)
+CONDICIONES_PADRON_VALIDAS: frozenset[str] = frozenset(
+    {"NUEVO", "USADO", "DETERIORADO", "BUENO", "REGULAR", "MALO"}
+)
+
+_ALIAS_UBICACIONES: tuple[tuple[str, str], ...] = (
+    ("ficct", "FICCT"),
+    ("facultad de ciencias veterinarias", "Veterinarias"),
+    ("veterinarias", "Veterinarias"),
+    ("veterinaria", "Veterinarias"),
+    ("fcv", "Veterinarias"),
+    ("yabare", "Yabaré"),
+    ("el prado", "El Prado"),
+    ("ciencias exactas", "Exactas y Tecnología"),
+    ("fcet", "Exactas y Tecnología"),
+    ("salud humana", "Salud Humana"),
+    ("medicina", "Salud Humana"),
+    ("daf", "DAF"),
+    ("duaf", "DAF"),
+    ("administrativa y financiera", "DAF"),
+    ("biblioteca", "Biblioteca"),
+    ("rectorado", "Rectorado"),
+    ("vicerrectorado", "Rectorado"),
+    ("decanato", "DECANATO"),
+    ("auditorio", "AUDITORIO"),
+    ("postgrado", "POSTGRADO"),
+    ("tecnologia", "TECNOLOGIA"),
+    ("derecho", "DERECHO"),
+    ("economia", "ECONOMIA"),
+    ("humanidades", "HUMANIDADES"),
+    ("camiri", "CAMIRI"),
+    ("montero", "MONTERO"),
+    ("vallecito", "VALLECITO"),
+    ("cpd", "CPD"),
+    ("almacen", "ALMACEN"),
+)
+
+_STOP_UBICACION_DINAMICA = (
+    r"\b(?:en\s+(?:mal|buen|regular)\s+estado|estado\s+\w+|condicion\s+\w+|"
+    r"con\s+valor|mayor(?:es)?|menor(?:es)?|entre\s+\d|gestion\s+20\d{2}|"
+    r"de\s+la\s+gestion|exporta\w*|en\s+pdf|en\s+excel|en\s+word|con\s+grafic\w*)\b"
+)
+
+
+def _parse_monto_bo(raw: str) -> float | None:
+    limpio = raw.strip().replace(" ", "")
+    if not limpio:
+        return None
+    if "," in limpio and "." in limpio:
+        if limpio.rfind(",") > limpio.rfind("."):
+            limpio = limpio.replace(".", "").replace(",", ".")
+        else:
+            limpio = limpio.replace(",", "")
+    elif "." in limpio:
+        partes = limpio.split(".")
+        if (len(partes) == 2 and len(partes[1]) == 3) or len(partes) > 2:
+            limpio = "".join(partes)
+    elif "," in limpio:
+        partes = limpio.split(",")
+        if (len(partes) == 2 and len(partes[1]) == 3) or len(partes) > 2:
+            limpio = "".join(partes)
+        else:
+            limpio = limpio.replace(",", ".")
+    try:
+        return float(limpio)
+    except ValueError:
+        return None
+
+
+def _resolver_ubicacion_consulta(consulta_usuario: str, norm: str) -> str | None:
+    if any(p in norm for p in ("todas las unidades", "todas las oficinas", "todo el padron", "toda la universidad")):
+        return None
+    for clave, valor_canon in _ALIAS_UBICACIONES:
+        if re.search(rf"\b{re.escape(clave)}\b", norm):
+            return valor_canon
+    m_dyn = re.search(
+        r"(?:en\s+(?:la|el)\s+|de\s+(?:la|el)\s+)?(?:facultad|unidad|oficina|departamento|direccion|carrera|centro|sede)\s+(?:de\s+)?([a-z0-9\s\.\-]{3,50})",
+        norm,
+    )
+    if m_dyn:
+        frag = re.split(_STOP_UBICACION_DINAMICA, m_dyn.group(1))[0].strip(" .,;:-")
+        if frag and frag not in _UNIDADES_GENERICAS_IGNORADAS and len(frag) >= 3:
+            # Conservar capitalización natural del texto original si es posible
+            idx = norm.find(frag)
+            if idx != -1:
+                return frag.title() if len(frag) > 5 else frag.upper()
+    return None
+
+
 def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
-    """Traduce criterios en lenguaje natural hacia filtros estructurados para reportes UAGRM."""
+    """Traduce criterios complejos en lenguaje natural hacia filtros exactos del padrón PostgreSQL UAGRM."""
     norm = normalizar_texto(consulta_usuario)
     if not norm:
         return {
@@ -236,70 +332,95 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
         }
 
     estado: str | None = None
-    if "baja" in norm or "desincorporad" in norm:
+    if any(p in norm for p in ("en reparacion", "reparacion", "mantenimiento", "por reparar", "en taller")):
+        estado = "EN_REPARACION"
+    elif re.search(r"\b(?:de\s+baja|dados?\s+de\s+baja|baja\s+patrimonial|desincorporad\w*|\bbajas?\b)", norm):
         estado = "BAJA"
-    elif "asignad" in norm or "custodia" in norm:
+    elif any(
+        p in norm
+        for p in ("mal estado", "estado malo", "danad", "averiad", "inutilizad", "inservible", "defectuos")
+    ) or re.search(r"\bmalos?\b|\bmalas?\b", norm):
+        estado = "MALO"
+    elif "estado regular" in norm or re.search(r"\bregular(?:es)?\b", norm):
+        estado = "REGULAR"
+    elif any(p in norm for p in ("buen estado", "estado bueno", "optimo", "optimas")) or re.search(
+        r"\bbuenos?\b|\bbuenas?\b", norm
+    ):
+        estado = "BUENO"
+    elif "asignad" in norm and "no asignad" not in norm:
         estado = "ASIGNADO"
-    elif "activ" in norm and "activo fijo" not in norm:
-        estado = "ACTIVO"
 
     condicion: str | None = None
-    if any(p in norm for p in ("malo", "inutilizad", "deteriorad", "dañad", "danad")):
-        condicion = "MALO"
-    elif "regular" in norm:
-        condicion = "REGULAR"
-    elif "bueno" in norm or "optimo" in norm:
-        condicion = "BUENO"
+    if "deteriorad" in norm or "desgastad" in norm:
+        condicion = "DETERIORADO"
+    elif re.search(r"\busad[oa]s?\b|\bsegunda mano\b", norm):
+        condicion = "USADO"
+    elif (
+        any(
+            p in norm
+            for p in ("condicion nuevo", "condicion nueva", "en nuevo estado", "activos nuevos", "bienes nuevos", "equipos nuevos")
+        )
+        or re.search(r"\bnuev[oa]s?\b", norm)
+    ) and "nueva sesion" not in norm and "nueva consulta" not in norm and "nuevo reporte" not in norm:
+        condicion = "NUEVO"
 
     grupo: str | None = None
-    if any(p in norm for p in ("comput", "laptop", "pc", "servidor", "impresora", "monitor")):
-        grupo = "EQUIPOS DE COMPUTACIÓN"
-    elif any(p in norm for p in ("muebl", "escritorio", "silla", "estante", "mesa")):
-        grupo = "MUEBLES Y ENSERES"
-    elif any(p in norm for p in ("vehic", "camioneta", "auto", "bus")):
-        grupo = "VEHÍCULOS"
-    elif any(p in norm for p in ("laboratorio", "microscopio", "equipo medico")):
-        grupo = "EQUIPOS DE LABORATORIO"
+    if any(
+        p in norm
+        for p in ("comput", "laptop", "portatil", "pc ", "servidor", "impresora", "monitor", "comunicacion", "telecom", "red ")
+    ) and "facultad de cs. de la computacion" not in norm and "de la computacion" not in norm:
+        grupo = "Equipos de Computación"
+    elif any(p in norm for p in ("muebl", "enseres", "escritorio", "silla", "estante", "mesa", "archivador", "armario", "butaca")):
+        grupo = "Muebles y Enseres"
+    elif any(p in norm for p in ("vehic", "automotor", "camioneta", "vagoneta", "bus ", "automovil", "camion")):
+        grupo = "Vehículos"
+    elif any(p in norm for p in ("maquinaria", "laboratorio", "microscopio", "equipo medico", "generador", "centrifuga", "compresor")):
+        grupo = "Maquinaria y Equipo"
+    elif any(p in norm for p in ("herramienta", "equipo tecnico", "taladro", "soldador")):
+        grupo = "Herramientas"
+    elif any(p in norm for p in ("edificacion", "edificio", "inmueble", "infraestructura")):
+        grupo = "Edificaciones"
+    elif any(p in norm for p in ("terreno", "lote", "predio")):
+        grupo = "Terrenos"
+    elif any(p in norm for p in ("semoviente", "pedigree", "ganado", "reproductor")):
+        grupo = "Semovientes"
+    elif "animal" in norm and "trabajo" in norm:
+        grupo = "Animales de Trabajo"
+    elif any(p in norm for p in ("patrimonio historico", "historico", "artistico", "cultural")):
+        grupo = "Patrimonio Histórico"
 
-    ubicacion: str | None = None
-    for sigla in (
-        "ficct",
-        "decanato",
-        "biblioteca",
-        "rectorado",
-        "auditorio",
-        "duaf",
-        "postgrado",
-        "tecnologia",
-        "derecho",
-        "economia",
-        "humanidades",
-        "veterinaria",
-        "camiri",
-        "montero",
-        "vallecito",
-        "cpd",
-        "almacen",
-    ):
-        if sigla in norm:
-            ubicacion = sigla.upper()
-            break
+    ubicacion = _resolver_ubicacion_consulta(consulta_usuario, norm)
 
     valor_min: float | None = None
     valor_max: float | None = None
-    m_min = re.search(
-        r"(?:mayor(?:es)?\s*(?:a|que|de)|desd?e\s*bs\.?|>=?)\s*(\d+(?:[.,]\d+)?)", norm
+    m_rango = re.search(
+        r"entre\s*(?:bs\.?\s*)?(\d+(?:[.,]\d+)?)\s*(?:bs\.?)?\s*(?:y|a|hasta)\s*(?:bs\.?\s*)?(\d+(?:[.,]\d+)?)",
+        norm,
     )
-    if m_min:
-        valor_min = float(m_min.group(1).replace(",", "."))
-    m_max = re.search(
-        r"(?:menor(?:es)?\s*(?:a|que|de)|hasta\s*bs\.?|<=?)\s*(\d+(?:[.,]\d+)?)", norm
-    )
-    if m_max:
-        valor_max = float(m_max.group(1).replace(",", "."))
+    if m_rango:
+        v1 = _parse_monto_bo(m_rango.group(1))
+        v2 = _parse_monto_bo(m_rango.group(2))
+        if v1 is not None and v2 is not None:
+            valor_min = min(v1, v2)
+            valor_max = max(v1, v2)
+    else:
+        for pat_min in (
+            r"(?:mayor(?:es)?\s*(?:a|que|de)|superior(?:es)?\s*(?:a|que)|mas\s+de|a\s+partir\s+de|>=?|>)\s*(?:bs\.?\s*)?(\d+(?:[.,]\d+)?)",
+            r"desde\s+bs\.?\s*(\d+(?:[.,]\d+)?)",
+        ):
+            m_min = re.search(pat_min, norm)
+            if m_min:
+                valor_min = _parse_monto_bo(m_min.group(1))
+                break
+        m_max = re.search(
+            r"(?:menor(?:es)?\s*(?:a|que|de)|inferior(?:es)?\s*(?:a|que)|menos\s+de|hasta|como\s+maximo|<=?|<)\s*(?:bs\.?\s*)?(\d+(?:[.,]\d+)?)",
+            norm,
+        )
+        if m_max:
+            valor_max = _parse_monto_bo(m_max.group(1))
 
     gestion: int | None = None
-    m_anio = re.search(r"\b(20\d{2})\b", norm)
+    m_anio = re.search(r"\b(199\d|20\d{2})\b", norm)
     if m_anio:
         gestion = int(m_anio.group(1))
 
@@ -307,6 +428,23 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
     m_cod = re.search(r"\b([a-z]\d{6,10}|\d{4}-\d{2}-\d{3,6})\b", consulta_usuario, flags=re.IGNORECASE)
     if m_cod:
         search = m_cod.group(1).upper()
+    else:
+        for palabra_clave in (
+            "aire acondicionado",
+            "proyector",
+            "impresora",
+            "microscopio",
+            "servidor",
+            "camioneta",
+            "escritorio",
+            "fotocopiadora",
+            "scanner",
+            "ups",
+            "pizarra",
+        ):
+            if re.search(rf"\b{re.escape(palabra_clave)}(?:s|es)?\b", norm):
+                search = palabra_clave.upper()
+                break
 
     return {
         "search": search,
@@ -530,6 +668,14 @@ _UNIDADES_GENERICAS_IGNORADAS: frozenset[str] = frozenset(
         "condiciones",
         "patrimonio",
         "inventario",
+        "en reparacion",
+        "reparacion",
+        "nuevo",
+        "nuevos",
+        "usado",
+        "usados",
+        "deteriorado",
+        "deteriorados",
         "bueno o malo",
         "estadisticas generales",
     }
@@ -542,28 +688,197 @@ def _normalizar_unidad_stats(valor: Any) -> str | None:
         return None
     norm = normalizar_texto(s)
     if norm in _UNIDADES_GENERICAS_IGNORADAS or any(
-        w in norm for w in ("bueno", "malo", "regular", "estadistic", "padron", "general")
+        w in norm for w in ("bueno", "malo", "regular", "reparacion", "deterior", "estadistic", "padron", "general")
     ):
         return None
     return s
 
 
+def extraer_destinatario_instruccion(instruccion_usuario: str) -> tuple[str | None, str | None]:
+    """Extrae destinatario y cargo implícitos si el usuario los indicó en lenguaje natural."""
+    texto = " ".join(instruccion_usuario.strip().split())
+    if not texto:
+        return None, None
+
+    patron_con_nombre = re.search(
+        r"(?:dirigid[oa]\s+a(?:l)?|destinatari[oa]\s*:?\s*|para\s+(?:el|la)?)\s+"
+        r"((?:Ing\.?|Lic\.?|Dr\.?|Dra\.?|M\.?Sc\.?|Arq\.?|Abg\.?|Sr\.?|Sra\.?)\s+"
+        r"[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+){0,3})"
+        r"(?:\s*(?:,|\(|-)\s*([A-Za-zÁÉÍÓÚáéíóúÑñ0-9\s\.\/-]{4,70})(?:\)|$|[.;]))?",
+        texto,
+    )
+    if patron_con_nombre:
+        nombre = patron_con_nombre.group(1).strip(" ,.;:-")
+        cargo = patron_con_nombre.group(2).strip(" ,.;:-()") if patron_con_nombre.group(2) else None
+        return nombre, cargo
+
+    norm = normalizar_texto(texto)
+    cargos_directos = (
+        ("rector", ("Sr. Rector de la UAGRM", "Rectorado Universitario — UAGRM")),
+        ("vicerrector", ("Sr. Vicerrector de la UAGRM", "Vicerrectorado — UAGRM")),
+        ("director administrativo", ("Director Administrativo y Financiero (DUAF)", "DUAF — UAGRM")),
+        ("daf", ("Director Administrativo y Financiero (DUAF)", "DUAF — UAGRM")),
+        ("duaf", ("Director Administrativo y Financiero (DUAF)", "DUAF — UAGRM")),
+        ("jefe de activos", ("Jefatura del Departamento de Activos Fijos", "Departamento de Activos Fijos — DUAF")),
+        ("decan", ("Sr. Decano de Facultad", "Decanato Facultativo — UAGRM")),
+        ("auditoria", ("Jefatura de Auditoría Interna", "Dirección de Auditoría Interna — UAGRM")),
+    )
+    if any(cue in norm for cue in ("dirigid", "destinatari", "para el", "para la", "al sr", "a la ")):
+        for clave, (nombre_c, cargo_c) in cargos_directos:
+            if clave in norm:
+                return nombre_c, cargo_c
+    return None, None
+
+
+def detectar_exportacion_carta(instruccion_usuario: str) -> list[str]:
+    """Detecta si el usuario pidió explícitamente exportar o descargar la carta en Word o PDF."""
+    norm = normalizar_texto(instruccion_usuario)
+    if any(neg in norm for neg in ("no export", "sin export", "no descarg", "no imprim", "aun no")):
+        return []
+    verbo_accion = any(
+        v in norm
+        for v in ("export", "descarg", "genera el ", "generar en", "en formato", "imprim", "sacar en", "listo para")
+    )
+    formatos: list[str] = []
+    if re.search(r"\b(?:word|docx)\b", norm) and (verbo_accion or "en word" in norm or "a word" in norm):
+        formatos.append("word")
+    if re.search(r"\bpdf\b", norm) and (verbo_accion or "en pdf" in norm or "a pdf" in norm):
+        formatos.append("pdf")
+    return formatos
+
+
+def detectar_edicion_parcial_carta(instruccion_usuario: str) -> dict[str, Any]:
+    """Identifica si una corrección en sesión temporal apunta a un párrafo o sección específica."""
+    norm = normalizar_texto(instruccion_usuario)
+    ordinales = {
+        "primer": 1,
+        "1": 1,
+        "primero": 1,
+        "segundo": 2,
+        "2": 2,
+        "tercer": 3,
+        "3": 3,
+        "tercero": 3,
+        "cuarto": 4,
+        "4": 4,
+        "quinto": 5,
+        "5": 5,
+        "ultimo": -1,
+    }
+    indice_parrafo: int | None = None
+    m_p = re.search(
+        r"parrafo\s*(?:n[°º]?\s*)?(1|2|3|4|5|primer[oa]?|segund[oa]?|tercer[oa]?|cuart[oa]?|quint[oa]?|ultim[oa]?)"
+        r"|(primer[oa]?|segund[oa]?|tercer[oa]?|cuart[oa]?|quint[oa]?|ultim[oa]?)\s+parrafo",
+        norm,
+    )
+    if m_p:
+        token = (m_p.group(1) or m_p.group(2) or "").rstrip("oa")
+        for clave, idx in ordinales.items():
+            if token == clave or token.startswith(clave.rstrip("oa")):
+                indice_parrafo = idx
+                break
+
+    solo_destinatario = any(p in norm for p in ("cambia el destinatario", "cambiar destinatario", "dirigida a ", "dirigido a "))
+    solo_referencia = any(p in norm for p in ("cambia la referencia", "cambiar referencia", "ajusta el asunto", "cambia el titulo"))
+    return {
+        "indice_parrafo_1based": indice_parrafo,
+        "toca_destinatario": solo_destinatario,
+        "toca_referencia": solo_referencia,
+    }
+
+
+def detectar_formatos_exportacion_reporte(consulta_usuario: str) -> list[str]:
+    """Detecta si el usuario pidió exportar el reporte inmediatamente en PDF, Excel y/o Word."""
+    norm = normalizar_texto(consulta_usuario)
+    if any(
+        neg in norm
+        for neg in ("no export", "sin export", "no descarg", "todavia no", "aun no", "primero muestrame")
+    ):
+        return []
+    if any(
+        p in norm
+        for p in ("todos los formatos", "los tres formatos", "los 3 formatos", "en pdf, excel y word", "pdf excel y word")
+    ):
+        return ["pdf", "excel", "word"]
+
+    quiere_exportar = any(
+        v in norm
+        for v in (
+            "export",
+            "descarg",
+            "genera en",
+            "generar en",
+            "sacar en",
+            "imprim",
+            "formato pdf",
+            "formato word",
+            "formato excel",
+            "en pdf",
+            "en excel",
+            "en word",
+        )
+    )
+    if not quiere_exportar:
+        return []
+
+    formatos: list[str] = []
+    if re.search(r"\bpdf\b", norm) or "imprimir" in norm:
+        formatos.append("pdf")
+    if re.search(r"\b(?:excel|xlsx)\b", norm):
+        formatos.append("excel")
+    if re.search(r"\b(?:word|docx)\b", norm):
+        formatos.append("word")
+    return formatos
+
+
+def detectar_incluir_graficas(consulta_usuario: str) -> bool:
+    """Devuelve True solo si el usuario solicita explícitamente gráficas o gráficos en el reporte."""
+    norm = normalizar_texto(consulta_usuario)
+    if any(neg in norm for neg in ("sin grafic", "no incluir grafic", "no agregues grafic")):
+        return False
+    return bool(re.search(r"\b(?:grafic[oa]s?|diagramas?|grafico de barras|grafico circular)\b", norm))
+
+
 def clasificar_intencion_redaccion(instruccion_usuario: str) -> dict[str, Any]:
     """Clasifica el tipo de trámite UAGRM (baja, revalúo, corrección, etc.) desde texto libre."""
     q = normalizar_texto(instruccion_usuario)
-    if any(p in q for p in ("nuevo activo", "dotacion", "adquisicion", "comprar", "equipamiento nuevo")):
+    if any(
+        p in q
+        for p in (
+            "nuevo activo",
+            "dotacion",
+            "adquisicion",
+            "comprar",
+            "equipamiento nuevo",
+            "adquirir",
+            "provision de nuevo",
+        )
+    ):
         tipo = "SOLICITUD_NUEVO_ACTIVO"
-    elif any(p in q for p in ("descargo", "incidente", "extravio", "robo", "hurto", "siniestro")):
+    elif any(p in q for p in ("descargo", "incidente", "extravio", "robo", "hurto", "siniestro", "sustraccion", "perdida")):
         tipo = "DESCARGO_INCIDENTE"
-    elif any(p in q for p in ("baja", "desincorpor", "inservible", "inutilizad", "obsolet", "quemad")):
+    elif any(
+        p in q
+        for p in (
+            "dar de baja",
+            "solicitud de baja",
+            "baja definitiva",
+            "baja patrimonial",
+            "desincorpor",
+            "inservible",
+            "inutilizad",
+            "obsolet",
+            "quemad",
+        )
+    ) or re.search(r"\bbaja\b", q):
         tipo = "SOLICITUD_BAJA"
-    elif any(p in q for p in ("revalu", "revaloriz", "valor residual", "vida util")):
+    elif any(p in q for p in ("revalu", "revaloriz", "valor residual", "vida util", "depreciado a 1")):
         tipo = "SOLICITUD_REVALUO"
-    elif any(p in q for p in ("reasigna", "transfer", "traslad", "custodio")):
+    elif any(p in q for p in ("reasigna", "transfer", "traslad", "custodio", "cambio de responsable")):
         tipo = "SOLICITUD_REASIGNACION"
-    elif any(p in q for p in ("inventario", "verificacion fisica", "conciliacion")):
+    elif any(p in q for p in ("inventario", "verificacion fisica", "conciliacion", "levantamiento fisico")):
         tipo = "SOLICITUD_INVENTARIO"
-    elif any(p in q for p in ("informe tecnico", "dictamen")):
+    elif any(p in q for p in ("informe tecnico", "dictamen tecnico", "peritaje", "evaluacion tecnica")):
         tipo = "INFORME_TECNICO"
     else:
         tipo = "SOLICITUD_CORRECCION_DATOS"
@@ -667,23 +982,27 @@ async def consultar_proyeccion_random_forest(horizonte_meses: int = 6) -> dict[s
 
 
 def prompt_redaccion_carta_uagrm(recurso_mcp_json: str, instruccion_usuario: str) -> str:
-    """Plantilla formal MCP para redacción de notas administrativas UAGRM sin alucinaciones."""
+    """Plantilla formal MCP para redacción de notas administrativas extensas y detalladas UAGRM."""
     return (
-        "Redacta el cuerpo epistolar de una carta formal UAGRM en español de Bolivia "
-        "usando EXCLUSIVAMENTE los datos del Recurso MCP adjunto.\n"
+        "Eres el Secretario Administrativo y Técnico del Departamento de Activos Fijos de la UAGRM (Bolivia). "
+        "Redacta una CARTA ADMINISTRATIVA OFICIAL extensa, sólida, formal y pulcra en español administrativo boliviano, "
+        "anclada EXCLUSIVAMENTE en los hechos y valores verificados del Recurso MCP adjunto.\n"
         f"Recurso MCP: {recurso_mcp_json}\n"
-        f"Motivo o instrucción del solicitante: {instruccion_usuario}\n\n"
-        "Reglas de estilo:\n"
-        "- NO incluyas fecha, destinatario, 'Señor(a)', 'Presente' ni firma dentro de cuerpo_parrafos "
-        "(el formato Word/PDF ya los agrega).\n"
-        "- Moneda oficial: Bolivianos abreviado estrictamente como 'Bs.' (NUNCA uses 'Bs.S' ni dólares).\n"
-        "- Genera exactamente 3 párrafos claros y formales en cuerpo_parrafos:\n"
-        "  1) Objeto de la solicitud y referencia a la unidad solicitante y normativa UAGRM aplicable.\n"
-        "  2) Detalle técnico del activo (si existe codigo en Recurso MCP, cítalo exacto con su descripción y monto) "
-        "o especificación del requerimiento.\n"
-        "  3) Párrafo de disposición para verificación técnica/anexo y cierre cordial.\n\n"
-        "Devuelve SOLO un objeto JSON con las claves exactas:\n"
-        '{"referencia": string, "cuerpo_parrafos": [string, string, string], "despedida": string}'
+        f"Instrucción / necesidad del solicitante: {instruccion_usuario}\n\n"
+        "Reglas estrictas de calidad y redacción:\n"
+        "1. NUNCA repitas textualmente la frase informal del usuario como muletilla ('conforme al motivo: ...'); "
+        "transforma su intención en prosa jurídica y técnica de alto nivel institucional.\n"
+        "2. NO incluyas fecha, destinatario, 'Señor(a)', 'Presente.-', firmas ni despedida dentro de 'cuerpo_parrafos' "
+        "(el encabezado Word/PDF los incorpora automáticamente).\n"
+        "3. Moneda oficial: Bolivianos abreviado estrictamente como 'Bs.' (NUNCA uses Bs.S ni dólares).\n"
+        "4. Redacta 4 a 5 párrafos sustanciales y bien desarrollados (al menos 55 a 85 palabras por párrafo) en 'cuerpo_parrafos':\n"
+        "   - Párrafo 1 (Antecedentes y Objeto): Identifica la unidad solicitante, invoca la responsabilidad funcional/custodia y expone con claridad el objeto administrativo del trámite.\n"
+        "   - Párrafo 2 (Detalle Técnico / Patrimonial): Si 'recurso_activo_mcp' tiene datos, detalla código exacto, descripción, ubicación, estado y valor en Bs.; si es 'SOLICITUD_NUEVO_ACTIVO', fundamenta la brecha operativa, utilidad académica/administrativa y especificaciones técnicas del equipamiento requerido.\n"
+        "   - Párrafo 3 (Justificación Técnica y Motivación): Desarrolla los argumentos causales (falla técnica, obsolescencia, vida útil remanente, inconsistencia de registro, traspaso de custodia o urgencia operativa según corresponda).\n"
+        "   - Párrafo 4 (Fundamento Normativo y Procedimiento): Invoca con propiedad la normativa pertinente del Recurso MCP (D.S. N° 0181, Ley N° 1178, R.R. N° 449/2013, R.R. N° 567/2018 V2) y, si 'incluye_anexo_tecnico' es true, señala expresamente que se adjunta el Informe Técnico / Ficha Patrimonial en anexo.\n"
+        "   - Párrafo 5 (Petición Concreta y Disposición): Formula el petitorio administrativo expreso para su providencia y manifiesta plena disposición para verificación técnica o documental.\n\n"
+        "Devuelve SOLO un objeto JSON válido con estas claves exactas:\n"
+        '{"referencia": string, "cuerpo_parrafos": [string, string, string, string, string], "despedida": string}'
     )
 
 
@@ -698,9 +1017,12 @@ def prompt_interpretar_reporte_uagrm(
         f"Módulo: {contexto_modulo}\n"
         f"Consulta en lenguaje natural: {consulta_usuario or 'Sin filtro adicional'}\n"
         f"Resumen real del lote (JSON): {resumen_lote_json}\n\n"
+        "Regla: usa exactamente los estados y condiciones del padrón PostgreSQL UAGRM "
+        "(estados: BUENO, REGULAR, MALO, EN_REPARACION, BAJA; condiciones: NUEVO, USADO, DETERIORADO) "
+        "y no inventes valores que no estén en la consulta o en el resumen.\n"
         "Devuelve SOLO JSON con estas claves:\n"
-        '{"filtros": {"search": str|null, "estado": "ACTIVO"|"ASIGNADO"|"BAJA"|null, '
-        '"condicion": "BUENO"|"REGULAR"|"MALO"|null, "grupo_contable": str|null, '
+        '{"filtros": {"search": str|null, "estado": "BUENO"|"REGULAR"|"MALO"|"EN_REPARACION"|"BAJA"|null, '
+        '"condicion": "NUEVO"|"USADO"|"DETERIORADO"|null, "grupo_contable": str|null, '
         '"ubicacion": str|null, "valor_min": float|null, "valor_max": float|null, "gestion": int|null}, '
         '"explicacion": str, "resumen_ejecutivo": str|null, "hallazgos_clave": [str]}'
     )
