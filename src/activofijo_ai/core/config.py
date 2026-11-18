@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     llm_model: str = Field(default="uagrm-activo-fijo")
     llm_timeout_seconds: float = Field(default=60.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0, le=8192)
+    whisper_model: str = Field(default="base")
 
     models_dir: Path = Field(default_factory=lambda: _ruta_raiz_proyecto() / "models")
 

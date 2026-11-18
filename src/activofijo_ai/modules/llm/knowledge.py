@@ -98,12 +98,20 @@ GUIA_RUTAS_SISTEMA: tuple[RutaSistemaGuia, ...] = (
         guia_breve="En Documentos y Actas puede consultar sus actas de asignación y usar 'Redactar Carta IA' para generar notas formales.",
     ),
     RutaSistemaGuia(
+        ruta="/reportes-ia",
+        titulo="Reportes IA",
+        descripcion="Generación de reportes inteligentes por voz o lenguaje natural con exportación oficial PDF/Excel.",
+        permiso_requerido="activos:consultar",
+        palabras_clave=("reporte", "reportes", "excel", "analisis", "analitica", "padron", "estadistica", "ia", "exportar"),
+        guia_breve="Ingrese a Reportes IA desde el menú lateral para consultar activos por lenguaje natural o voz y exportar el informe en PDF o Excel.",
+    ),
+    RutaSistemaGuia(
         ruta="/activos",
         titulo="Consulta de Activos",
-        descripcion="Catálogo patrimonial, búsqueda, ficha técnica y exportación con Resumen IA.",
+        descripcion="Catálogo patrimonial, búsqueda, ficha técnica y exportación tabular.",
         permiso_requerido="activos:consultar",
-        palabras_clave=("activo", "activos", "catalogo", "buscar", "ficha", "reporte", "excel", "exportar"),
-        guia_breve="En Consultas -> Consulta de Activos puede filtrar bienes y abrir 'Exportar / Reportes' con filtros o Resumen IA.",
+        palabras_clave=("activo", "activos", "catalogo", "buscar", "ficha"),
+        guia_breve="En Consultas -> Consulta de Activos puede filtrar bienes y revisar o exportar cada ficha del inventario.",
     ),
     RutaSistemaGuia(
         ruta="/trazabilidad",

@@ -8,6 +8,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from activofijo_ai.core.config import get_settings
 from activofijo_ai.core.security import validar_clave_interna_valor
+from activofijo_ai.modules.audio.engine import obtener_modelo_whisper_compartido
+from activofijo_ai.modules.audio.router import router as audio_router
 from activofijo_ai.modules.llm.mcp_server import crear_servidor_mcp
 from activofijo_ai.modules.llm.provider import OpenAICompatibleLlmClient
 from activofijo_ai.modules.llm.router import router as llm_router
@@ -50,9 +52,17 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        """Precalienta ONNX + Ollama en RAM en segundo plano y gestiona FastMCP."""
+        """Precalienta ONNX, Whisper local y Ollama en RAM en segundo plano."""
         obtener_motor_rapidocr_compartido()
         settings = _app.dependency_overrides.get(get_settings, get_settings)()
+        if settings.env != "test":
+            asyncio.create_task(
+                asyncio.to_thread(
+                    obtener_modelo_whisper_compartido,
+                    settings.whisper_model,
+                    str(settings.models_dir),
+                )
+            )
         warmup_task: asyncio.Task[bool] | None = None
         if settings.env != "test" and settings.llm_provider.lower() == "ollama":
             warmup_task = asyncio.create_task(
@@ -73,6 +83,7 @@ def create_app() -> FastAPI:
     app.include_router(system_router)
     app.include_router(ml_router)
     app.include_router(vision_router)
+    app.include_router(audio_router)
     app.include_router(llm_router)
     app.mount("/mcp", _ProteccionClaveInternaMcpMiddleware(servidor_mcp.streamable_http_app(), app))
     return app
