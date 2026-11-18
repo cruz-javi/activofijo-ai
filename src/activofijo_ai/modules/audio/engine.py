@@ -151,6 +151,7 @@ def obtener_modelo_whisper_compartido(nombre_modelo: str, ruta_modelos: str) -> 
         nombre_modelo,
         device="cpu",
         compute_type="int8",
+        cpu_threads=4,
         download_root=str(whisper_dir),
         local_files_only=ya_cacheado,
     )
@@ -198,7 +199,11 @@ class ServicioTranscripcionVoz:
             audio_pcm,
             language=idioma_corto,
             beam_size=1,
-            vad_filter=duracion_seg >= 1.2,
+            best_of=1,
+            temperature=0.0,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            without_timestamps=True,
             initial_prompt=PROMPT_CONTEXTO_UAGRM,
         )
         partes = [str(seg.text or "").strip() for seg in segmentos if str(seg.text or "").strip()]

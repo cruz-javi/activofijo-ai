@@ -3,8 +3,11 @@
 import importlib.util
 import json
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
+
+EmitirEventoFn = Callable[[dict[str, Any]], Awaitable[None]]
 
 from mcp.server.fastmcp import FastMCP
 
@@ -152,6 +155,21 @@ def _simplificar_schema_ollama(schema: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
+_ETIQUETAS_HERRAMIENTAS: dict[str, str] = {
+    "clasificar_intencion_redaccion": "Clasificación automática de trámite",
+    "consultar_ficha_activo": "Verificación de ficha patrimonial",
+    "validar_integridad_texto": "Validación de consistencia institucional",
+    "filtrar_catalogo_reportes": "Interpretación de criterios de búsqueda",
+    "consultar_guia_sistema": "Guía operativa de módulos y permisos",
+    "buscar_activos_padron": "Búsqueda en padrón institucional",
+    "obtener_estadisticas_padron": "Estadísticas generales del inventario",
+    "consultar_riesgo_normativo": "Evaluación normativa y prioridades",
+    "consultar_trazabilidad_sha256": "Historial y verificación de bien",
+    "consultar_proyeccion_random_forest": "Proyección presupuestaria",
+    "consultar_reglas_normativas": "Reglamento institucional aplicable",
+}
+
+
 def _resumir_observacion_tool(nombre_tool: str, obs: dict[str, Any]) -> str:
     if obs.get("ok") is False or obs.get("error"):
         return str(obs.get("error") or "Error consultando fuente")
@@ -169,7 +187,7 @@ def _resumir_observacion_tool(nombre_tool: str, obs: dict[str, Any]) -> str:
         return f"{len(obs.get('candidatos') or [])} candidato(s) normativos evaluados"
     if nombre_tool == "consultar_trazabilidad_sha256":
         integ = obs.get("verificacionIntegridad") or {}
-        return f"Integridad SHA-256: {integ.get('estado', 'VERIFICADA')}"
+        return f"Verificación de historial: {integ.get('estado', 'VERIFICADA')}"
     if nombre_tool == "consultar_proyeccion_random_forest":
         proy = obs.get("proyeccionAjustadaHorizonte") or {}
         return (
@@ -178,11 +196,27 @@ def _resumir_observacion_tool(nombre_tool: str, obs: dict[str, Any]) -> str:
         )
     if nombre_tool == "clasificar_intencion_redaccion":
         return f"Trámite detectado: {obs.get('tipo_documento', 'SOLICITUD_CORRECCION_DATOS')}"
-    return "Ejecución MCP completada"
+    if nombre_tool == "consultar_guia_sistema":
+        enlaces = obs.get("enlaces_directos") or []
+        return f"{len(enlaces)} módulo(s) autorizados verificados"
+    if nombre_tool == "filtrar_catalogo_reportes":
+        activos = [k for k, v in obs.items() if v is not None]
+        return f"{len(activos)} criterio(s) identificados" if activos else "Consulta general"
+    if nombre_tool == "consultar_ficha_activo":
+        cod = obs.get("codigo")
+        return f"Ficha {cod} validada" if cod else "Datos de ficha preparados"
+    if nombre_tool == "validar_integridad_texto":
+        return "Texto verificado sin inconsistencias"
+    return "Consulta institucional verificada"
+
+
+async def _emitir(emitir_evento: EmitirEventoFn | None, evento: dict[str, Any]) -> None:
+    if emitir_evento is not None:
+        await emitir_evento(evento)
 
 
 class McpBridgeService:
-    """Orquesta Recursos, Herramientas (incluyendo bucle ReAct live PostgreSQL) y Prompts."""
+    """Orquesta Recursos, Herramientas (incluyendo bucle ReAct en vivo) y Prompts."""
 
     def __init__(
         self,
@@ -198,15 +232,35 @@ class McpBridgeService:
         self,
         nombre_tool: str,
         argumentos: dict[str, Any],
+        emitir_evento: EmitirEventoFn | None = None,
+        paso_id: str | None = None,
     ) -> tuple[dict[str, Any], TrazaHerramientaMcp]:
+        etiqueta = _ETIQUETAS_HERRAMIENTAS.get(nombre_tool, "Consultando fuente institucional")
+        id_ev = paso_id or f"tool-{nombre_tool}-{int(time.perf_counter() * 1000)}"
+        await _emitir(
+            emitir_evento,
+            {"tipo": "paso", "id": id_ev, "etiqueta": etiqueta, "estado": "activo"},
+        )
         t0 = time.perf_counter()
         res_raw = await self._mcp.call_tool(nombre_tool, argumentos)
         duracion_ms = int((time.perf_counter() - t0) * 1000)
         obs = _extraer_dict_tool_mcp(res_raw)
+        resumen = _resumir_observacion_tool(nombre_tool, obs)
+        await _emitir(
+            emitir_evento,
+            {
+                "tipo": "paso",
+                "id": id_ev,
+                "etiqueta": etiqueta,
+                "detalle": resumen,
+                "duracionMs": duracion_ms,
+                "estado": "completado",
+            },
+        )
         traza = TrazaHerramientaMcp(
             herramienta=nombre_tool,
             argumentos=argumentos,
-            resumen_resultado=_resumir_observacion_tool(nombre_tool, obs),
+            resumen_resultado=resumen,
             duracion_ms=duracion_ms,
         )
         return obs, traza
@@ -260,6 +314,7 @@ class McpBridgeService:
         mensajes_iniciales: list[dict[str, Any]],
         nombres_tools: set[str],
         max_iteraciones: int = 4,
+        emitir_evento: EmitirEventoFn | None = None,
     ) -> tuple[str, str, int, list[TrazaHerramientaMcp], dict[str, dict[str, Any]]]:
         openai_tools = await self._tools_openai_desde_mcp(nombres_tools)
         mensajes = list(mensajes_iniciales)
@@ -271,16 +326,51 @@ class McpBridgeService:
 
         for ronda in range(max_iteraciones):
             tools_ronda = openai_tools if (openai_tools and ronda < max_iteraciones - 1) else None
+            id_paso = f"llm-ronda-{ronda}"
+            etiqueta_paso = (
+                "Analizando consulta e identificando fuentes"
+                if ronda == 0
+                else "Redactando síntesis con datos verificados"
+            )
+            await _emitir(
+                emitir_evento,
+                {"tipo": "paso", "id": id_paso, "etiqueta": etiqueta_paso, "estado": "activo"},
+            )
+            t_llm = time.perf_counter()
             res = await llm.generar_chat_completado(
                 mensajes=mensajes,
                 tools=tools_ronda,
             )
+            dur_llm_ms = int((time.perf_counter() - t_llm) * 1000)
             tokens_totales += res.tokens_usados
             modelo_usado = res.modelo
 
             if not res.tool_calls:
+                await _emitir(
+                    emitir_evento,
+                    {
+                        "tipo": "paso",
+                        "id": id_paso,
+                        "etiqueta": etiqueta_paso,
+                        "detalle": "Respuesta generada",
+                        "duracionMs": dur_llm_ms,
+                        "estado": "completado",
+                    },
+                )
                 contenido_final = res.contenido
                 break
+
+            await _emitir(
+                emitir_evento,
+                {
+                    "tipo": "paso",
+                    "id": id_paso,
+                    "etiqueta": etiqueta_paso,
+                    "detalle": f"{len(res.tool_calls)} consulta(s) solicitadas",
+                    "duracionMs": dur_llm_ms,
+                    "estado": "completado",
+                },
+            )
 
             mensajes.append(
                 {
@@ -307,7 +397,7 @@ class McpBridgeService:
                     traza = TrazaHerramientaMcp(
                         herramienta=tc.nombre,
                         argumentos={},
-                        resumen_resultado="Bloqueada por alcance MCP",
+                        resumen_resultado="Bloqueada por alcance",
                         duracion_ms=0,
                     )
                     trazas.append(traza)
@@ -322,7 +412,9 @@ class McpBridgeService:
                     if clave_dedup in cache_ronda:
                         obs = cache_ronda[clave_dedup]
                     else:
-                        obs, traza = await self._llamar_tool_con_traza(tc.nombre, args)
+                        obs, traza = await self._llamar_tool_con_traza(
+                            tc.nombre, args, emitir_evento=emitir_evento
+                        )
                         cache_ronda[clave_dedup] = obs
                         observaciones[tc.nombre] = obs
                         trazas.append(traza)
@@ -359,6 +451,7 @@ class McpBridgeService:
         self,
         payload: RedaccionAsistidaRequest,
         settings: Settings,
+        emitir_evento: EmitirEventoFn | None = None,
     ) -> RedaccionAsistidaResponse:
         trazas_mcp: list[TrazaHerramientaMcp] = []
         tipo_doc = payload.tipo_documento
@@ -366,6 +459,7 @@ class McpBridgeService:
             clasif_obs, clasif_traza = await self._llamar_tool_con_traza(
                 "clasificar_intencion_redaccion",
                 {"instruccion_usuario": payload.instruccion_usuario},
+                emitir_evento=emitir_evento,
             )
             trazas_mcp.append(clasif_traza)
             tipo_doc = str(clasif_obs.get("tipo_documento") or "SOLICITUD_CORRECCION_DATOS")  # type: ignore[assignment]
@@ -379,10 +473,12 @@ class McpBridgeService:
         )
         destinatario = (
             payload.destinatario_nombre
+            or (payload.borrador_actual.destinatario_nombre if payload.borrador_actual else None)
             or str(plantilla.get("destinatario_default") or "Jefatura del Departamento de Activos Fijos")
         ).strip()
         destinatario_cargo = (
             payload.destinatario_cargo
+            or (payload.borrador_actual.destinatario_cargo if payload.borrador_actual else None)
             or str(plantilla.get("cargo_destinatario_default") or "DUAF — UAGRM")
         ).strip()
 
@@ -399,6 +495,7 @@ class McpBridgeService:
                     "contexto_activo": ctx_raw,
                     "sanitizar_publico": payload.modo_acceso == "PUBLICO_HOME",
                 },
+                emitir_evento=emitir_evento,
             )
             trazas_mcp.append(ficha_traza)
 
@@ -438,18 +535,68 @@ class McpBridgeService:
 
         if settings.env != "test" or self._transport is not None:
             try:
-                res = await llm.generar_chat_completado(
-                    mensajes=[
+                await _emitir(
+                    emitir_evento,
+                    {
+                        "tipo": "paso",
+                        "id": "llm-redaccion",
+                        "etiqueta": "Redactando carta formal institucional",
+                        "estado": "activo",
+                    },
+                )
+                t_red = time.perf_counter()
+                mensajes_redaccion: list[dict[str, Any]] = [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Redactor institucional UAGRM bajo Protocolo MCP. "
+                            "Usa únicamente los códigos y valores del recurso MCP; nunca inventes cifras."
+                        ),
+                    }
+                ]
+                for turno in payload.historial[-6:]:
+                    mensajes_redaccion.append(
                         {
-                            "role": "system",
+                            "role": "user" if turno.rol == "usuario" else "assistant",
+                            "content": turno.texto,
+                        }
+                    )
+                if payload.borrador_actual is not None:
+                    borrador_json = json.dumps(
+                        payload.borrador_actual.model_dump(exclude_none=True),
+                        ensure_ascii=False,
+                    )
+                    mensajes_redaccion.append(
+                        {
+                            "role": "user",
                             "content": (
-                                "Redactor institucional UAGRM bajo Protocolo MCP. "
-                                "Usa únicamente los códigos y valores del recurso MCP; nunca inventes cifras."
+                                "SESIÓN TEMPORAL DE CORRECCIÓN DE CARTA: Toma este borrador actual como base "
+                                f"y devuelve la carta COMPLETA actualizada aplicando las correcciones solicitadas, "
+                                f"conservando intactos los datos/párrafos que no se pidió cambiar: {borrador_json}\n"
+                                f"Corrección solicitada: {payload.instruccion_usuario}\n"
+                                "Devuelve SOLO JSON con las claves: "
+                                '{"referencia": str, "destinatario_nombre": str|null, '
+                                '"destinatario_cargo": str|null, "cuerpo_parrafos": [str, ...], "despedida": str}'
                             ),
-                        },
-                        {"role": "user", "content": prompt_usuario},
-                    ],
+                        }
+                    )
+                else:
+                    mensajes_redaccion.append({"role": "user", "content": prompt_usuario})
+
+                res = await llm.generar_chat_completado(
+                    mensajes=mensajes_redaccion,
                     response_format={"type": "json_object"},
+                )
+                await _emitir(
+                    emitir_evento,
+                    {
+                        "tipo": "paso",
+                        "id": "llm-redaccion",
+                        "etiqueta": "Redactando carta formal institucional",
+                        "detalle": "Borrador epistolar generado",
+                        "duracionMs": int((time.perf_counter() - t_red) * 1000),
+                        "estado": "completado",
+                    },
                 )
                 datos = extraer_json_objeto(res.contenido)
                 if datos and isinstance(datos.get("cuerpo_parrafos"), list):
@@ -461,19 +608,29 @@ class McpBridgeService:
                             "cod_activo": codigo_activo,
                             "es_nuevo_sin_anexo": es_nuevo_sin_anexo,
                         },
+                        emitir_evento=emitir_evento,
                     )
                     trazas_mcp.append(val_traza)
                     parrafos = [str(p) for p in validado.get("cuerpo_parrafos", []) if str(p).strip()]
                     advertencias.extend(str(a) for a in validado.get("advertencias", []))
                     if parrafos:
+                        ref_prev = payload.borrador_actual.referencia if payload.borrador_actual else None
+                        desp_prev = payload.borrador_actual.despedida if payload.borrador_actual else None
                         referencia = normalizar_moneda_texto(
-                            str(datos.get("referencia") or referencia_base)
+                            str(datos.get("referencia") or ref_prev or referencia_base)
                         )
                         despedida = normalizar_moneda_texto(
                             str(
                                 datos.get("despedida")
+                                or desp_prev
                                 or "Con este motivo, saludo a usted con las consideraciones más distinguidas."
                             )
+                        )
+                        dest_nombre_out = (
+                            str(datos.get("destinatario_nombre") or "").strip() or destinatario
+                        )
+                        dest_cargo_out = (
+                            str(datos.get("destinatario_cargo") or "").strip() or destinatario_cargo
                         )
                         motor_id, _ = _resolver_motor(settings)
                         return RedaccionAsistidaResponse(
@@ -482,8 +639,8 @@ class McpBridgeService:
                             tipo_documento_detectado=tipo_doc,  # type: ignore[arg-type]
                             referencia=referencia,
                             lugar_fecha=lugar_fecha,
-                            destinatario_nombre=destinatario,
-                            destinatario_cargo=destinatario_cargo,
+                            destinatario_nombre=dest_nombre_out,
+                            destinatario_cargo=dest_cargo_out,
                             cuerpo_parrafos=parrafos,
                             despedida=despedida,
                             incluye_anexo_tecnico=incluye_anexo,
@@ -783,6 +940,24 @@ class McpBridgeService:
             gestion=int(raw["gestion"]) if isinstance(raw.get("gestion"), int) else base.gestion,
         )
 
+    def _heredar_filtros_sesion(
+        self,
+        actual: FiltrosDetectadosReporte,
+        previos_raw: dict[str, Any],
+    ) -> FiltrosDetectadosReporte:
+        prev_norm = {
+            "search": previos_raw.get("search"),
+            "estado": previos_raw.get("estado"),
+            "condicion": previos_raw.get("condicion"),
+            "grupo_contable": previos_raw.get("grupo_contable") or previos_raw.get("grupoContable"),
+            "ubicacion": previos_raw.get("ubicacion"),
+            "valor_min": previos_raw.get("valor_min") if previos_raw.get("valor_min") is not None else previos_raw.get("valorMin"),
+            "valor_max": previos_raw.get("valor_max") if previos_raw.get("valor_max") is not None else previos_raw.get("valorMax"),
+            "gestion": previos_raw.get("gestion"),
+        }
+        base_prev = self._combinar_filtros(FiltrosDetectadosReporte(), prev_norm)
+        return self._combinar_filtros(base_prev, actual.model_dump(exclude_none=True))
+
     def _explicar_filtros(self, f: FiltrosDetectadosReporte) -> str:
         partes: list[str] = []
         if f.search:
@@ -810,6 +985,7 @@ class McpBridgeService:
         self,
         payload: AyudaSistemaRequest,
         settings: Settings,
+        emitir_evento: EmitirEventoFn | None = None,
     ) -> AyudaSistemaResponse:
         tok_cli, tok_seg = self._preparar_contexto_seguridad(
             settings,
@@ -826,6 +1002,7 @@ class McpBridgeService:
                     "rol_usuario": payload.rol_usuario,
                     "permisos_usuario": payload.permisos_usuario,
                 },
+                emitir_evento=emitir_evento,
             )
             trazas_mcp.append(traza_guia)
 
@@ -862,30 +1039,34 @@ class McpBridgeService:
             llm = OpenAICompatibleLlmClient(settings, transport=self._transport)
             if settings.env != "test" or self._transport is not None:
                 try:
-                    prompt_res = await self._mcp.get_prompt(
-                        "prompt_asistente_sistema_uagrm",
-                        {
-                            "rol_usuario": payload.rol_usuario,
-                            "ruta_actual": payload.ruta_actual,
-                            "catalogo_permitido_json": json.dumps(catalogo_permitido, ensure_ascii=False),
-                            "pregunta": payload.pregunta,
-                        },
+                    titulos_modulos = ", ".join(
+                        f"{m.get('titulo')} ({m.get('ruta')})"
+                        for m in (catalogo_permitido or [])
+                        if isinstance(m, dict)
                     )
-                    prompt = _extraer_texto_prompt_mcp(prompt_res)
                     mensajes: list[dict[str, Any]] = [
                         {
                             "role": "system",
                             "content": (
-                                "Copiloto UAGRM con herramientas MCP conectadas a PostgreSQL. "
-                                "Usa herramientas MCP si preguntan datos reales de activos, estadísticas, "
-                                "riesgo normativo o trazabilidad SHA-256; nunca inventes rutas ni cifras."
+                                "Asistente UAGRM de Activos Fijos. Si preguntan cifras o bienes reales "
+                                "(cuántos activos, estado bueno/malo, montos en Bs., trazabilidad), "
+                                "INVOCA directamente las herramientas disponibles y responde con los datos reales. "
+                                "NUNCA menciones nombres de funciones ni herramientas internas en tu respuesta."
                             ),
                         },
                     ]
                     for turno in payload.historial[-4:]:
                         rol_chat = "user" if turno.rol == "usuario" else "assistant"
                         mensajes.append({"role": rol_chat, "content": turno.texto})
-                    mensajes.append({"role": "user", "content": prompt})
+                    mensajes.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Rol: {payload.rol_usuario} | Ruta: {payload.ruta_actual}. "
+                                f"Módulos permitidos: {titulos_modulos}.\nPregunta: {payload.pregunta}"
+                            ),
+                        }
+                    )
 
                     tools_ayuda = {
                         "buscar_activos_padron",
@@ -899,6 +1080,7 @@ class McpBridgeService:
                             mensajes_iniciales=mensajes,
                             nombres_tools=tools_ayuda,
                             max_iteraciones=2,
+                            emitir_evento=emitir_evento,
                         )
                     )
                     trazas_mcp.extend(trazas_react)
@@ -956,6 +1138,7 @@ class McpBridgeService:
         self,
         payload: ConsultaAnaliticaRequest,
         settings: Settings,
+        emitir_evento: EmitirEventoFn | None = None,
     ) -> ConsultaAnaliticaResponse:
         q_norm = normalizar_texto(payload.consulta)
         if any(p in q_norm for p in PALABRAS_BLOQUEO_EXTERNO):
@@ -975,10 +1158,33 @@ class McpBridgeService:
         try:
             trazas_mcp: list[TrazaHerramientaMcp] = []
             filtros_dict, traza_f = await self._llamar_tool_con_traza(
-                "filtrar_catalogo_reportes", {"consulta_usuario": payload.consulta}
+                "filtrar_catalogo_reportes",
+                {"consulta_usuario": payload.consulta},
+                emitir_evento=emitir_evento,
             )
             trazas_mcp.append(traza_f)
             filtros_det = FiltrosDetectadosReporte(**filtros_dict)
+            if (
+                payload.reporte_previo
+                and isinstance(payload.reporte_previo.filtros_detectados, dict)
+                and not any(
+                    pal in q_norm
+                    for pal in (
+                        "todo el padron",
+                        "sin filtro",
+                        "quita el filtro",
+                        "todos los estados",
+                        "todos los bienes",
+                        "sin unidad",
+                        "nueva consulta",
+                        "reiniciar",
+                    )
+                )
+            ):
+                filtros_det = self._heredar_filtros_sesion(
+                    filtros_det,
+                    payload.reporte_previo.filtros_detectados,
+                )
 
             activos_mencionados: list[dict[str, Any]] = []
             estadisticas: dict[str, Any] | None = None
@@ -999,23 +1205,42 @@ class McpBridgeService:
 
             if settings.env != "test" or self._transport is not None:
                 try:
-                    mensajes = [
+                    mensajes: list[dict[str, Any]] = [
                         {
                             "role": "system",
                             "content": (
-                                "Agente Analítico Patrimonial UAGRM. Consulta PostgreSQL vía MCP "
+                                "Agente Analítico Patrimonial UAGRM. Consulta fuentes vía herramientas "
                                 "(deja 'unidad' en null salvo que nombren una facultad/oficina concreta) "
                                 "y responde con cifras exactas en español boliviano y moneda Bs."
                             ),
                         },
-                        {"role": "user", "content": payload.consulta},
                     ]
+                    for turno in payload.historial[-6:]:
+                        mensajes.append(
+                            {
+                                "role": "user" if turno.rol == "usuario" else "assistant",
+                                "content": turno.texto,
+                            }
+                        )
+                    if payload.reporte_previo and payload.reporte_previo.resumen_ejecutivo:
+                        mensajes.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Contexto del reporte actual en sesión temporal (filtros previos: "
+                                    f"{json.dumps(payload.reporte_previo.filtros_detectados or {}, ensure_ascii=False)}): "
+                                    f"{payload.reporte_previo.resumen_ejecutivo[:500]}"
+                                ),
+                            }
+                        )
+                    mensajes.append({"role": "user", "content": payload.consulta})
                     contenido, modelo_usado, tokens_usados, trazas_react, obs = (
                         await self._ejecutar_bucle_react(
                             llm=llm,
                             mensajes_iniciales=mensajes,
                             nombres_tools=tools_analitica,
                             max_iteraciones=2,
+                            emitir_evento=emitir_evento,
                         )
                     )
                     trazas_mcp.extend(trazas_react)
@@ -1029,7 +1254,7 @@ class McpBridgeService:
                 except (LlmNoConfiguradoError, LlmErrorExternoError):
                     pass
 
-            # Asegura anclaje real en PostgreSQL si el modelo respondió sin invocar tool DB o estuvo offline
+            # Asegura anclaje real si el modelo respondió sin invocar tool DB o estuvo offline
             if not activos_mencionados and estadisticas is None:
                 busq_obs, traza_b = await self._llamar_tool_con_traza(
                     "buscar_activos_padron",
@@ -1044,6 +1269,7 @@ class McpBridgeService:
                         "gestion": filtros_det.gestion,
                         "limit": 10,
                     },
+                    emitir_evento=emitir_evento,
                 )
                 trazas_mcp.append(traza_b)
                 if busq_obs.get("ok") is not False:
@@ -1052,6 +1278,7 @@ class McpBridgeService:
                 stats_obs, traza_s = await self._llamar_tool_con_traza(
                     "obtener_estadisticas_padron",
                     {"unidad": filtros_det.ubicacion},
+                    emitir_evento=emitir_evento,
                 )
                 trazas_mcp.append(traza_s)
                 if stats_obs.get("ok") is not False:

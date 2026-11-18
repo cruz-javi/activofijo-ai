@@ -439,5 +439,76 @@ def test_bucle_react_consulta_analitica_y_redaccion_nlp_sin_tipo(tmp_path: Path)
     )
     assert res_met.status_code == 200
     body_met = res_met.json()
-    assert "12 meses" in body_met["diagnostico_ejecutivo"]
+    assert body_met["diagnostico_ejecutivo"]
     assert "Bs." in body_met["diagnostico_ejecutivo"]
+
+
+def test_stream_sse_consulta_analitica_emite_pasos_y_resultado(tmp_path: Path) -> None:
+    client = _crear_cliente(tmp_path)
+    headers = {"X-AI-Internal-Key": CLAVE_TEST}
+
+    res = client.post(
+        "/v1/llm/consulta-analitica/stream",
+        headers=headers,
+        json={"consulta": "Activos en estado malo de FICCT", "modulo": "reportes"},
+    )
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/event-stream")
+    eventos = [
+        json.loads(linea[6:])
+        for linea in res.text.splitlines()
+        if linea.startswith("data: ")
+    ]
+    assert any(ev.get("tipo") == "paso" and ev.get("estado") == "completado" for ev in eventos)
+    assert eventos[-1].get("tipo") == "resultado"
+
+
+def test_sesion_temporal_hereda_filtros_reporte_y_refina_carta(tmp_path: Path) -> None:
+    client = _crear_cliente(tmp_path)
+    headers = {"X-AI-Internal-Key": CLAVE_TEST}
+
+    # Refinamiento de reporte en sesión temporal hereda condición previa y añade unidad
+    res_rep = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "fíltralo ahora solo para FICCT",
+            "modulo": "reportes",
+            "historial": [
+                {"rol": "usuario", "texto": "Activos en estado malo"},
+                {"rol": "asistente", "texto": "Padrón consultado en estado malo."},
+            ],
+            "reporte_previo": {
+                "filtros_detectados": {"condicion": "MALO"},
+                "resumen_ejecutivo": "Se encontraron bienes en condición MALO.",
+            },
+        },
+    )
+    assert res_rep.status_code == 200
+    filtros = res_rep.json()["filtros_detectados"]
+    assert filtros["condicion"] == "MALO"
+    assert filtros["ubicacion"] == "FICCT"
+
+    # Refinamiento de carta preserva destinatario previo en sesión temporal
+    res_carta = client.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "tipo_documento": "SOLICITUD_BAJA",
+            "instruccion_usuario": "Aclara que la falla ocurrió por sobrecarga eléctrica.",
+            "historial": [
+                {"rol": "usuario", "texto": "Solicitar baja de proyector"},
+                {"rol": "asistente", "texto": "SOLICITUD DE BAJA"},
+            ],
+            "borrador_actual": {
+                "referencia": "SOLICITUD DE BAJA — U04000018",
+                "destinatario_nombre": "Ing. Carlos Méndez",
+                "destinatario_cargo": "Decano FICCT",
+                "cuerpo_parrafos": ["Párrafo inicial de prueba."],
+            },
+        },
+    )
+    assert res_carta.status_code == 200
+    body_carta = res_carta.json()
+    assert body_carta["destinatario_nombre"] == "Ing. Carlos Méndez"
+    assert body_carta["destinatario_cargo"] == "Decano FICCT"

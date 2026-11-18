@@ -1,10 +1,17 @@
-from typing import Annotated
+import asyncio
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Annotated, Any
 
+import httpx
 from fastapi import APIRouter, Depends
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from activofijo_ai.core.config import Settings, get_settings
 from activofijo_ai.core.security import verificar_clave_interna
 from activofijo_ai.modules.llm.mcp_bridge import McpBridgeService
+from activofijo_ai.modules.llm.provider import LlmErrorExternoError, LlmNoConfiguradoError
 from activofijo_ai.modules.llm.schemas import (
     AyudaSistemaRequest,
     AyudaSistemaResponse,
@@ -30,6 +37,37 @@ def get_mcp_bridge_service() -> McpBridgeService:
     return McpBridgeService()
 
 
+async def _generar_stream_sse(
+    ejecutor: Callable[[Callable[[dict[str, Any]], Awaitable[None]]], Awaitable[BaseModel]],
+) -> AsyncIterator[str]:
+    cola: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    async def emitir(ev: dict[str, Any]) -> None:
+        await cola.put(ev)
+
+    async def correr() -> None:
+        try:
+            resultado = await ejecutor(emitir)
+            await cola.put({"tipo": "resultado", "data": resultado.model_dump(mode="json")})
+        except asyncio.CancelledError:
+            raise
+        except (LlmNoConfiguradoError, LlmErrorExternoError, ValueError, RuntimeError, httpx.HTTPError) as exc:
+            await cola.put({"tipo": "error", "mensaje": str(exc)})
+        finally:
+            await cola.put(None)
+
+    tarea = asyncio.create_task(correr())
+    try:
+        while True:
+            item = await cola.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    finally:
+        if not tarea.done():
+            tarea.cancel()
+
+
 @router.post("/asistir-redaccion", response_model=RedaccionAsistidaResponse)
 async def asistir_redaccion(
     payload: RedaccionAsistidaRequest,
@@ -38,6 +76,20 @@ async def asistir_redaccion(
 ) -> RedaccionAsistidaResponse:
     """Redacta cartas, descargos e informes técnicos UAGRM con anclaje MCP sin alucinaciones."""
     return await mcp.asistir_redaccion(payload, settings)
+
+
+@router.post("/asistir-redaccion/stream")
+async def asistir_redaccion_stream(
+    payload: RedaccionAsistidaRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> StreamingResponse:
+    """Emite progreso en tiempo real (SSE) durante la redacción formal."""
+    return StreamingResponse(
+        _generar_stream_sse(lambda emit: mcp.asistir_redaccion(payload, settings, emit)),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/interpretar-consulta", response_model=ConsultaLenguajeNaturalResponse)
@@ -60,6 +112,20 @@ async def asistente_sistema(
     return await mcp.responder_ayuda_sistema(payload, settings)
 
 
+@router.post("/asistente-sistema/stream")
+async def asistente_sistema_stream(
+    payload: AyudaSistemaRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> StreamingResponse:
+    """Emite pasos en tiempo real (SSE) mientras el asistente consulta fuentes institucionales."""
+    return StreamingResponse(
+        _generar_stream_sse(lambda emit: mcp.responder_ayuda_sistema(payload, settings, emit)),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/consulta-analitica", response_model=ConsultaAnaliticaResponse)
 async def consulta_analitica(
     payload: ConsultaAnaliticaRequest,
@@ -68,6 +134,20 @@ async def consulta_analitica(
 ) -> ConsultaAnaliticaResponse:
     """Agente ReAct + FastMCP conectado a PostgreSQL para análisis patrimonial en lenguaje natural."""
     return await mcp.consultar_analitica_padron(payload, settings)
+
+
+@router.post("/consulta-analitica/stream")
+async def consulta_analitica_stream(
+    payload: ConsultaAnaliticaRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> StreamingResponse:
+    """Emite progreso en tiempo real (SSE) durante consultas analíticas del padrón."""
+    return StreamingResponse(
+        _generar_stream_sse(lambda emit: mcp.consultar_analitica_padron(payload, settings, emit)),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/diagnostico-metricas", response_model=DiagnosticoMetricasResponse)

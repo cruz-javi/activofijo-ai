@@ -37,6 +37,14 @@ class TurnoConversacionInput(BaseModel):
     texto: str = Field(..., min_length=1, max_length=600)
 
 
+class BorradorCartaInput(BaseModel):
+    referencia: str | None = Field(default=None, max_length=250)
+    destinatario_nombre: str | None = Field(default=None, max_length=120)
+    destinatario_cargo: str | None = Field(default=None, max_length=120)
+    cuerpo_parrafos: list[str] = Field(default_factory=list, max_length=8)
+    despedida: str | None = Field(default=None, max_length=250)
+
+
 class RedaccionAsistidaRequest(BaseModel):
     tipo_documento: TipoDocumentoCarta | None = None
     modo_acceso: ModoAccesoCarta = "INTERNO_SISTEMA"
@@ -50,6 +58,8 @@ class RedaccionAsistidaRequest(BaseModel):
     contexto_activo: dict[str, Any] | None = None
     contexto_normativo: dict[str, Any] | None = None
     contexto_seguridad: ContextoSeguridadMcpInput | None = None
+    historial: list[TurnoConversacionInput] = Field(default_factory=list, max_length=8)
+    borrador_actual: BorradorCartaInput | None = None
 
 
 class RedaccionAsistidaResponse(BaseModel):
@@ -138,10 +148,17 @@ class AyudaSistemaResponse(BaseModel):
     tokens_usados: int = 0
 
 
+class ReportePrevioInput(BaseModel):
+    filtros_detectados: dict[str, Any] | None = None
+    resumen_ejecutivo: str | None = Field(default=None, max_length=1200)
+
+
 class ConsultaAnaliticaRequest(BaseModel):
     consulta: str = Field(..., min_length=3, max_length=800)
     modulo: str = Field(default="activos", max_length=60)
     contexto_seguridad: ContextoSeguridadMcpInput | None = None
+    historial: list[TurnoConversacionInput] = Field(default_factory=list, max_length=8)
+    reporte_previo: ReportePrevioInput | None = None
 
 
 class ConsultaAnaliticaResponse(BaseModel):
