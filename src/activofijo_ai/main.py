@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -8,6 +9,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from activofijo_ai.core.config import get_settings
 from activofijo_ai.core.security import validar_clave_interna_valor
 from activofijo_ai.modules.llm.mcp_server import crear_servidor_mcp
+from activofijo_ai.modules.llm.provider import OpenAICompatibleLlmClient
 from activofijo_ai.modules.llm.router import router as llm_router
 from activofijo_ai.modules.ml.router import router as ml_router
 from activofijo_ai.modules.system.router import router as system_router
@@ -48,10 +50,18 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        """Precalienta ONNX en CPU y administra el gestor de sesiones StreamableHTTP MCP."""
+        """Precalienta ONNX + Ollama en RAM en segundo plano y gestiona FastMCP."""
         obtener_motor_rapidocr_compartido()
+        settings = _app.dependency_overrides.get(get_settings, get_settings)()
+        warmup_task: asyncio.Task[bool] | None = None
+        if settings.env != "test" and settings.llm_provider.lower() == "ollama":
+            warmup_task = asyncio.create_task(
+                OpenAICompatibleLlmClient(settings).precalentar_ollama()
+            )
         async with servidor_mcp.session_manager.run():
             yield
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
 
     app = FastAPI(
         title="UAGRM Activo Fijo AI Service",

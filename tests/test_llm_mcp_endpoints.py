@@ -17,6 +17,7 @@ CLAVE_TEST = "test_internal_ai_key_super_segura_32_caracteres!"
 def _crear_cliente(
     tmp_path: Path,
     transport: httpx.AsyncBaseTransport | None = None,
+    core_transport: httpx.AsyncBaseTransport | None = None,
 ) -> TestClient:
     app = create_app()
     settings = Settings(
@@ -28,7 +29,8 @@ def _crear_cliente(
     )
     app.dependency_overrides[get_settings] = lambda: settings
     app.dependency_overrides[get_mcp_bridge_service] = lambda: McpBridgeService(
-        transport=transport
+        transport=transport,
+        core_transport=core_transport,
     )
     return TestClient(app)
 
@@ -300,3 +302,142 @@ def test_endpoint_jsonrpc_streamable_http_mcp_protegido(tmp_path: Path) -> None:
         assert call_result["structuredContent"]["grupo_contable"] == "VEHÍCULOS"
         assert call_result["structuredContent"]["condicion"] == "MALO"
         assert call_result["structuredContent"]["ubicacion"] == "FICCT"
+
+
+def test_bucle_react_consulta_analitica_y_redaccion_nlp_sin_tipo(tmp_path: Path) -> None:
+    turnos_llm = {"count": 0}
+    llamadas_core: list[str] = []
+
+    async def mock_ollama(request: httpx.Request) -> httpx.Response:
+        turnos_llm["count"] += 1
+        body = json.loads(request.content.decode("utf-8"))
+        # Ronda 1 ReAct: el LLM solicita ejecutar herramienta MCP contra PostgreSQL Core
+        if turnos_llm["count"] == 1:
+            assert "tools" in body and len(body["tools"]) >= 3
+            return httpx.Response(
+                200,
+                json={
+                    "model": "uagrm-activo-fijo",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_act_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "buscar_activos_padron",
+                                            "arguments": json.dumps(
+                                                {"unidad": "FICCT", "condicion": "MALO"}
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ],
+                    "usage": {"total_tokens": 55},
+                },
+            )
+        # Ronda 2 ReAct: recibe observación de PostgreSQL Core y sintetiza respuesta real
+        return httpx.Response(
+            200,
+            json={
+                "model": "uagrm-activo-fijo",
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Se halló 1 bien en estado MALO en FICCT: Proyector Epson (U04000018) valuado en Bs. 4.200,00."
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 80},
+            },
+        )
+
+    async def mock_core(request: httpx.Request) -> httpx.Response:
+        llamadas_core.append(request.url.path)
+        assert request.headers.get("X-AI-Internal-Key") == CLAVE_TEST
+        return httpx.Response(
+            200,
+            json={
+                "totalCoincidencias": 1,
+                "restringidoPorCustodia": False,
+                "sanitizadoPublico": False,
+                "valorMuestraBs": 4200.0,
+                "activos": [
+                    {
+                        "codigo": "U04000018",
+                        "descripcion": "Proyector Epson PowerLite",
+                        "grupoContable": "EQUIPOS DE COMPUTACIÓN",
+                        "ubicacion": "FICCT",
+                        "estado": "ASIGNADO",
+                        "condicion": "MALO",
+                        "valorBs": 4200.0,
+                        "custodio": "Ing. Carlos Pérez",
+                    }
+                ],
+            },
+        )
+
+    client = _crear_cliente(
+        tmp_path,
+        transport=httpx.MockTransport(mock_ollama),
+        core_transport=httpx.MockTransport(mock_core),
+    )
+    headers = {"X-AI-Internal-Key": CLAVE_TEST}
+
+    res_ana = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "¿Qué bienes en estado malo existen en la FICCT?",
+            "modulo": "activos",
+            "contexto_seguridad": {"acceso_amplio": True, "rol_usuario": "ADMINISTRADOR"},
+        },
+    )
+    assert res_ana.status_code == 200
+    body_ana = res_ana.json()
+    assert turnos_llm["count"] == 2
+    assert "/internal/mcp/buscar-activos" in llamadas_core
+    assert body_ana["motor_utilizado"] == "ollama_personalizado"
+    assert "U04000018" in body_ana["respuesta"]
+    assert any(t["herramienta"] == "buscar_activos_padron" for t in body_ana["trazas_mcp"])
+    assert body_ana["activos_mencionados"][0]["codigo"] == "U04000018"
+
+    # Redacción NLP sin tipo_documento explícito -> autodetecta SOLICITUD_REVALUO
+    client_det = _crear_cliente(tmp_path)
+    res_nlp = client_det.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "instruccion_usuario": "Necesito solicitar un revalúo técnico pericial para extender vida útil.",
+            "solicitante_unidad": "Decanato FICCT",
+        },
+    )
+    assert res_nlp.status_code == 200
+    assert res_nlp.json()["tipo_documento_detectado"] == "SOLICITUD_REVALUO"
+
+    # Diagnóstico RF + Normativa
+    res_met = client_det.post(
+        "/v1/llm/diagnostico-metricas",
+        headers=headers,
+        json={
+            "horizonte_meses": 12,
+            "datos_metricas": {
+                "proyeccionAjustadaHorizonte": {
+                    "bajasEstimadas": 14,
+                    "presupuestoReposicionBs": 48500.0,
+                },
+                "resumenNormativo": {
+                    "totalCandidatosBaja": 6,
+                    "totalSugeridosRevaluo": 9,
+                },
+            },
+        },
+    )
+    assert res_met.status_code == 200
+    body_met = res_met.json()
+    assert "12 meses" in body_met["diagnostico_ejecutivo"]
+    assert "Bs." in body_met["diagnostico_ejecutivo"]

@@ -8,8 +8,12 @@ from activofijo_ai.modules.llm.mcp_bridge import McpBridgeService
 from activofijo_ai.modules.llm.schemas import (
     AyudaSistemaRequest,
     AyudaSistemaResponse,
+    ConsultaAnaliticaRequest,
+    ConsultaAnaliticaResponse,
     ConsultaLenguajeNaturalRequest,
     ConsultaLenguajeNaturalResponse,
+    DiagnosticoMetricasRequest,
+    DiagnosticoMetricasResponse,
     RedaccionAsistidaRequest,
     RedaccionAsistidaResponse,
 )
@@ -54,3 +58,23 @@ async def asistente_sistema(
 ) -> AyudaSistemaResponse:
     """Asistente guiado del sistema UAGRM con enlaces directos filtrados por permisos RBAC."""
     return await mcp.responder_ayuda_sistema(payload, settings)
+
+
+@router.post("/consulta-analitica", response_model=ConsultaAnaliticaResponse)
+async def consulta_analitica(
+    payload: ConsultaAnaliticaRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> ConsultaAnaliticaResponse:
+    """Agente ReAct + FastMCP conectado a PostgreSQL para análisis patrimonial en lenguaje natural."""
+    return await mcp.consultar_analitica_padron(payload, settings)
+
+
+@router.post("/diagnostico-metricas", response_model=DiagnosticoMetricasResponse)
+async def diagnostico_metricas(
+    payload: DiagnosticoMetricasRequest,
+    settings: Annotated[Settings, Depends(get_settings)],
+    mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
+) -> DiagnosticoMetricasResponse:
+    """Diagnóstico presupuestario IA integrando proyección Random Forest y priorización normativa."""
+    return await mcp.diagnosticar_metricas(payload, settings)

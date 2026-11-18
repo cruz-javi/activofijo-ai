@@ -3,11 +3,19 @@
 import json
 import re
 import unicodedata
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import Field
 
+from activofijo_ai.core.config import get_settings
+from activofijo_ai.modules.llm.core_client import (
+    DEFAULT_SEGURIDAD_MCP,
+    CoreMcpBridgeClient,
+    core_bridge_ctx,
+    seguridad_mcp_ctx,
+)
 from activofijo_ai.modules.llm.knowledge import (
     GUIA_RUTAS_SISTEMA,
     PALABRAS_BLOQUEO_EXTERNO,
@@ -254,7 +262,25 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
         grupo = "EQUIPOS DE LABORATORIO"
 
     ubicacion: str | None = None
-    for sigla in ("ficct", "decanato", "biblioteca", "rectorado", "auditorio", "duaf", "postgrado"):
+    for sigla in (
+        "ficct",
+        "decanato",
+        "biblioteca",
+        "rectorado",
+        "auditorio",
+        "duaf",
+        "postgrado",
+        "tecnologia",
+        "derecho",
+        "economia",
+        "humanidades",
+        "veterinaria",
+        "camiri",
+        "montero",
+        "vallecito",
+        "cpd",
+        "almacen",
+    ):
         if sigla in norm:
             ubicacion = sigla.upper()
             break
@@ -452,6 +478,189 @@ def validar_integridad_texto(
     return {"cuerpo_parrafos": parrafos, "advertencias": advertencias}
 
 
+def _obtener_cliente_y_seguridad() -> tuple[CoreMcpBridgeClient, dict[str, Any]]:
+    cliente = core_bridge_ctx.get()
+    if cliente is None:
+        cliente = CoreMcpBridgeClient(get_settings())
+    seg = seguridad_mcp_ctx.get() or DEFAULT_SEGURIDAD_MCP
+    return cliente, {
+        "usuarioId": seg.get("usuario_id"),
+        "rolUsuario": seg.get("rol_usuario") or "FUNCIONARIO",
+        "permisosUsuario": seg.get("permisos_usuario") or [],
+        "codigoEmpleadoLegado": seg.get("codigo_empleado_legado"),
+        "accesoAmplio": bool(seg.get("acceso_amplio", False)),
+        "sanitizarPublico": bool(seg.get("sanitizar_publico", False)),
+    }
+
+
+def _normalizar_param_opcional(valor: Any) -> str | None:
+    if valor is None:
+        return None
+    s = str(valor).strip()
+    if not s or s.lower() in {"null", "none", "todos", "n/a", ""}:
+        return None
+    return s
+
+
+_UNIDADES_GENERICAS_IGNORADAS: frozenset[str] = frozenset(
+    {
+        "general",
+        "generales",
+        "padron",
+        "global",
+        "todos",
+        "todo",
+        "total",
+        "uagrm",
+        "universidad",
+        "bueno",
+        "buenos",
+        "regular",
+        "regulares",
+        "malo",
+        "malos",
+        "activo",
+        "activos",
+        "asignado",
+        "baja",
+        "bajas",
+        "estado",
+        "estados",
+        "condicion",
+        "condiciones",
+        "patrimonio",
+        "inventario",
+        "bueno o malo",
+        "estadisticas generales",
+    }
+)
+
+
+def _normalizar_unidad_stats(valor: Any) -> str | None:
+    s = _normalizar_param_opcional(valor)
+    if not s:
+        return None
+    norm = normalizar_texto(s)
+    if norm in _UNIDADES_GENERICAS_IGNORADAS or any(
+        w in norm for w in ("bueno", "malo", "regular", "estadistic", "padron", "general")
+    ):
+        return None
+    return s
+
+
+def clasificar_intencion_redaccion(instruccion_usuario: str) -> dict[str, Any]:
+    """Clasifica el tipo de trámite UAGRM (baja, revalúo, corrección, etc.) desde texto libre."""
+    q = normalizar_texto(instruccion_usuario)
+    if any(p in q for p in ("nuevo activo", "dotacion", "adquisicion", "comprar", "equipamiento nuevo")):
+        tipo = "SOLICITUD_NUEVO_ACTIVO"
+    elif any(p in q for p in ("descargo", "incidente", "extravio", "robo", "hurto", "siniestro")):
+        tipo = "DESCARGO_INCIDENTE"
+    elif any(p in q for p in ("baja", "desincorpor", "inservible", "inutilizad", "obsolet", "quemad")):
+        tipo = "SOLICITUD_BAJA"
+    elif any(p in q for p in ("revalu", "revaloriz", "valor residual", "vida util")):
+        tipo = "SOLICITUD_REVALUO"
+    elif any(p in q for p in ("reasigna", "transfer", "traslad", "custodio")):
+        tipo = "SOLICITUD_REASIGNACION"
+    elif any(p in q for p in ("inventario", "verificacion fisica", "conciliacion")):
+        tipo = "SOLICITUD_INVENTARIO"
+    elif any(p in q for p in ("informe tecnico", "dictamen")):
+        tipo = "INFORME_TECNICO"
+    else:
+        tipo = "SOLICITUD_CORRECCION_DATOS"
+    return {"tipo_documento": tipo, "normativa": consultar_reglas_normativas(tipo)}
+
+
+async def buscar_activos_padron(
+    search: str | None = None,
+    codigo: str | None = None,
+    unidad: str | None = None,
+    estado: str | None = None,
+    condicion: str | None = None,
+    grupo_contable: str | None = None,
+    valor_min: float | None = None,
+    valor_max: float | None = None,
+    gestion: int | None = None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Busca activos reales en PostgreSQL UAGRM por código, texto libre, unidad, estado, condición o rango Bs."""
+    cliente, seg = _obtener_cliente_y_seguridad()
+    return await cliente.post_internal(
+        "buscar-activos",
+        {
+            "search": _normalizar_param_opcional(search),
+            "codigo": _normalizar_param_opcional(codigo),
+            "unidad": _normalizar_unidad_stats(unidad),
+            "estado": _normalizar_param_opcional(estado),
+            "condicion": _normalizar_param_opcional(condicion),
+            "grupoContable": _normalizar_param_opcional(grupo_contable),
+            "valorMin": valor_min,
+            "valorMax": valor_max,
+            "gestion": gestion,
+            "limit": max(1, min(int(limit or 10), 25)),
+            "seguridad": seg,
+        },
+    )
+
+
+async def obtener_estadisticas_padron(
+    unidad: Annotated[
+        str | None,
+        Field(description="Solo oficina/facultad exacta; null si es global"),
+    ] = None,
+) -> dict[str, Any]:
+    """Obtiene conteos exactos y sumatoria total en Bs. del padrón PostgreSQL UAGRM por estado, condición y grupo."""
+    cliente, seg = _obtener_cliente_y_seguridad()
+    return await cliente.post_internal(
+        "estadisticas-padron",
+        {
+            "unidad": _normalizar_unidad_stats(unidad),
+            "seguridad": seg,
+        },
+    )
+
+
+async def consultar_riesgo_normativo(
+    dictamen: str | None = None,
+    nivel_prioridad: str | None = None,
+    search: str | None = None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    """Consulta activos priorizados por el Motor Normativo (CANDIDATO_BAJA R.R. 449/2013 y SUGERIDO_REVALUO R.R. 567/2018)."""
+    cliente, seg = _obtener_cliente_y_seguridad()
+    return await cliente.post_internal(
+        "riesgo-normativo",
+        {
+            "dictamen": _normalizar_param_opcional(dictamen),
+            "nivelPrioridad": _normalizar_param_opcional(nivel_prioridad),
+            "search": _normalizar_param_opcional(search),
+            "limit": max(1, min(int(limit or 8), 15)),
+            "seguridad": seg,
+        },
+    )
+
+
+async def consultar_trazabilidad_sha256(cod_activo: str) -> dict[str, Any]:
+    """Verifica la cadena criptográfica SHA-256 e historial de custodia/movimientos de un activo por su código."""
+    cliente, seg = _obtener_cliente_y_seguridad()
+    return await cliente.post_internal(
+        "trazabilidad",
+        {
+            "codActivo": cod_activo.strip().upper(),
+            "seguridad": seg,
+        },
+    )
+
+
+async def consultar_proyeccion_random_forest(horizonte_meses: int = 6) -> dict[str, Any]:
+    """Consulta la proyección Random Forest de bajas esperadas y presupuesto de reposición en Bs. (3, 6 o 12 meses)."""
+    cliente, _ = _obtener_cliente_y_seguridad()
+    horizon = horizonte_meses if horizonte_meses in (3, 6, 12) else 6
+    return await cliente.post_internal(
+        "proyeccion-rf",
+        {"horizonteMeses": horizon},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Primitiva 3: Plantillas de Instrucción MCP (Prompts)
 # ---------------------------------------------------------------------------
@@ -533,6 +742,12 @@ def crear_servidor_mcp() -> FastMCP:
         resumir_lote_patrimonial,
         consultar_guia_sistema,
         validar_integridad_texto,
+        clasificar_intencion_redaccion,
+        buscar_activos_padron,
+        obtener_estadisticas_padron,
+        consultar_riesgo_normativo,
+        consultar_trazabilidad_sha256,
+        consultar_proyeccion_random_forest,
     ):
         servidor.tool()(herramienta)
 

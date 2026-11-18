@@ -16,8 +16,29 @@ TipoDocumentoCarta = Literal[
 ModoAccesoCarta = Literal["PUBLICO_HOME", "INTERNO_SISTEMA"]
 
 
+class TrazaHerramientaMcp(BaseModel):
+    herramienta: str
+    argumentos: dict[str, Any] = Field(default_factory=dict)
+    resumen_resultado: str
+    duracion_ms: int = 0
+
+
+class ContextoSeguridadMcpInput(BaseModel):
+    usuario_id: str | None = None
+    rol_usuario: str | None = "FUNCIONARIO"
+    permisos_usuario: list[str] = Field(default_factory=list)
+    codigo_empleado_legado: int | None = None
+    acceso_amplio: bool = False
+    sanitizar_publico: bool = False
+
+
+class TurnoConversacionInput(BaseModel):
+    rol: Literal["usuario", "asistente"]
+    texto: str = Field(..., min_length=1, max_length=600)
+
+
 class RedaccionAsistidaRequest(BaseModel):
-    tipo_documento: TipoDocumentoCarta
+    tipo_documento: TipoDocumentoCarta | None = None
     modo_acceso: ModoAccesoCarta = "INTERNO_SISTEMA"
     cod_activo: str | None = Field(default=None, max_length=50)
     instruccion_usuario: str = Field(..., min_length=5, max_length=1500)
@@ -28,11 +49,13 @@ class RedaccionAsistidaRequest(BaseModel):
     destinatario_cargo: str | None = Field(default=None, max_length=120)
     contexto_activo: dict[str, Any] | None = None
     contexto_normativo: dict[str, Any] | None = None
+    contexto_seguridad: ContextoSeguridadMcpInput | None = None
 
 
 class RedaccionAsistidaResponse(BaseModel):
     motor_utilizado: Literal["ollama_personalizado", "llm_remoto", "respaldo_determinista"]
     modelo: str
+    tipo_documento_detectado: TipoDocumentoCarta | None = None
     referencia: str
     lugar_fecha: str
     destinatario_nombre: str
@@ -42,6 +65,7 @@ class RedaccionAsistidaResponse(BaseModel):
     incluye_anexo_tecnico: bool
     fundamento_normativo: list[str] = Field(default_factory=list)
     advertencias: list[str] = Field(default_factory=list)
+    trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
     tokens_usados: int = 0
 
 
@@ -57,7 +81,9 @@ class ResumenLoteReporteInput(BaseModel):
 class ConsultaLenguajeNaturalRequest(BaseModel):
     consulta_usuario: str = Field(default="", max_length=600)
     contexto_modulo: str = Field(default="activos", max_length=60)
+    consultar_padron_real: bool = False
     resumen_lote: ResumenLoteReporteInput | None = None
+    contexto_seguridad: ContextoSeguridadMcpInput | None = None
 
 
 class FiltrosDetectadosReporte(BaseModel):
@@ -79,6 +105,9 @@ class ConsultaLenguajeNaturalResponse(BaseModel):
     resumen_ejecutivo: str | None = None
     hallazgos_clave: list[str] = Field(default_factory=list)
     advertencias: list[str] = Field(default_factory=list)
+    trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
+    estadisticas_padron: dict[str, Any] | None = None
+    muestras_activos: list[dict[str, Any]] = Field(default_factory=list)
     tokens_usados: int = 0
 
 
@@ -93,6 +122,8 @@ class AyudaSistemaRequest(BaseModel):
     ruta_actual: str = Field(default="/dashboard", max_length=120)
     rol_usuario: str = Field(default="FUNCIONARIO", max_length=80)
     permisos_usuario: list[str] = Field(default_factory=list, max_length=100)
+    historial: list[TurnoConversacionInput] = Field(default_factory=list, max_length=6)
+    contexto_seguridad: ContextoSeguridadMcpInput | None = None
 
 
 class AyudaSistemaResponse(BaseModel):
@@ -102,4 +133,41 @@ class AyudaSistemaResponse(BaseModel):
     pasos: list[str] = Field(default_factory=list)
     enlaces_directos: list[EnlaceDirectoSistema] = Field(default_factory=list)
     fuera_de_ambito: bool = False
+    trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
+    filtros_navegacion: FiltrosDetectadosReporte | None = None
+    tokens_usados: int = 0
+
+
+class ConsultaAnaliticaRequest(BaseModel):
+    consulta: str = Field(..., min_length=3, max_length=800)
+    modulo: str = Field(default="activos", max_length=60)
+    contexto_seguridad: ContextoSeguridadMcpInput | None = None
+
+
+class ConsultaAnaliticaResponse(BaseModel):
+    motor_utilizado: Literal["ollama_personalizado", "llm_remoto", "respaldo_determinista"]
+    modelo: str
+    respuesta: str
+    filtros_detectados: FiltrosDetectadosReporte
+    activos_mencionados: list[dict[str, Any]] = Field(default_factory=list)
+    estadisticas: dict[str, Any] | None = None
+    trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
+    fuera_de_ambito: bool = False
+    tokens_usados: int = 0
+
+
+class DiagnosticoMetricasRequest(BaseModel):
+    horizonte_meses: int = Field(default=6, ge=3, le=12)
+    pregunta_usuario: str | None = Field(default=None, max_length=400)
+    datos_metricas: dict[str, Any] = Field(default_factory=dict)
+    contexto_seguridad: ContextoSeguridadMcpInput | None = None
+
+
+class DiagnosticoMetricasResponse(BaseModel):
+    motor_utilizado: Literal["ollama_personalizado", "llm_remoto", "respaldo_determinista"]
+    modelo: str
+    diagnostico_ejecutivo: str
+    recomendaciones: list[str] = Field(default_factory=list)
+    alertas_presupuestarias: list[str] = Field(default_factory=list)
+    trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
     tokens_usados: int = 0

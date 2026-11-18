@@ -22,10 +22,18 @@ class LlmErrorExternoError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ToolCallLlm:
+    id: str
+    nombre: str
+    argumentos_json: str
+
+
+@dataclass(frozen=True)
 class ResultadoChatLlm:
     contenido: str
     modelo: str
     tokens_usados: int
+    tool_calls: tuple[ToolCallLlm, ...] = ()
 
 
 def extraer_json_objeto(texto: str) -> dict[str, Any] | None:
@@ -72,10 +80,12 @@ class OpenAICompatibleLlmClient:
 
     async def generar_chat_completado(
         self,
-        mensajes: list[dict[str, str]],
-        response_format: dict[str, str] | None = None,
+        mensajes: list[dict[str, Any]],
+        response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
     ) -> ResultadoChatLlm:
-        """Envía una solicitud Chat Completions al proveedor OpenAI-compatible configurado."""
+        """Envía una solicitud Chat Completions (con soporte tool_calls ReAct) al proveedor LLM."""
         api_key = self._settings.llm_api_key.strip()
         es_ollama = self._settings.llm_provider.lower() == "ollama"
         if not api_key and not es_ollama:
@@ -99,10 +109,13 @@ class OpenAICompatibleLlmClient:
                 "model": modelo,
                 "messages": mensajes,
                 "max_tokens": self._settings.llm_max_tokens,
-                "temperature": 0.15,
+                "temperature": 0.1,
             }
-            if response_format is not None:
+            if response_format is not None and not tools:
                 payload["response_format"] = response_format
+            if tools:
+                payload["tools"] = tools
+                payload["tool_choice"] = tool_choice or "auto"
 
             try:
                 async with httpx.AsyncClient(
@@ -142,6 +155,29 @@ class OpenAICompatibleLlmClient:
 
             mensaje = choices[0].get("message") or {}
             contenido = str(mensaje.get("content") or "")
+            raw_calls = mensaje.get("tool_calls") or []
+            tool_calls_norm: list[ToolCallLlm] = []
+            for idx, tc in enumerate(raw_calls):
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                nombre = str(fn.get("name") or "").strip()
+                if not nombre:
+                    continue
+                args_raw = fn.get("arguments")
+                args_str = (
+                    json.dumps(args_raw, ensure_ascii=False)
+                    if isinstance(args_raw, dict)
+                    else str(args_raw or "{}")
+                )
+                tool_calls_norm.append(
+                    ToolCallLlm(
+                        id=str(tc.get("id") or f"call_{idx}"),
+                        nombre=nombre,
+                        argumentos_json=args_str,
+                    )
+                )
+
             usage = data.get("usage") or {}
             tokens = int(usage.get("total_tokens") or 0)
 
@@ -149,7 +185,31 @@ class OpenAICompatibleLlmClient:
                 contenido=contenido,
                 modelo=str(data.get("model") or modelo),
                 tokens_usados=tokens,
+                tool_calls=tuple(tool_calls_norm),
             )
 
         assert ultimo_error is not None
         raise ultimo_error
+
+    async def precalentar_ollama(self) -> bool:
+        """Precarga el modelo personalizado en RAM de Ollama con keep_alive."""
+        if self._settings.llm_provider.lower() != "ollama":
+            return False
+        base = self._settings.llm_base_url.rstrip("/")
+        base = base.removesuffix("/v1")
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(12.0, connect=2.0),
+                transport=self._transport,
+            ) as client:
+                res = await client.post(
+                    f"{base}/api/generate",
+                    json={
+                        "model": self._settings.llm_model,
+                        "prompt": "",
+                        "keep_alive": "25m",
+                    },
+                )
+            return res.status_code < 400
+        except httpx.HTTPError:
+            return False

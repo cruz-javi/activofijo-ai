@@ -220,6 +220,9 @@ PALABRAS_DOMINIO_VALIDO: tuple[str, ...] = (
     "contraseña", "contrasena", "password", "clave", "2fa", "totp", "usuario", "rol",
     "permiso", "uagrm", "duaf", "formulario", "sistema", "hola", "ayuda", "como", "donde",
     "puedo", "que", "explica", "depreciacion", "ufv", "residual", "dmmu", "utalab",
+    "proyector", "computadora", "laptop", "escritorio", "vehiculo", "mobiliario", "equipo",
+    "ficct", "decanato", "biblioteca", "rectorado", "postgrado", "cuantos", "cuanto",
+    "estado", "malo", "bueno", "regular", "valor", "presupuesto", "padron", "sha", "sha256",
 )
 
 PALABRAS_BLOQUEO_EXTERNO: tuple[str, ...] = (
