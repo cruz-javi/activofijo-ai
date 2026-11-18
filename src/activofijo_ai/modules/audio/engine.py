@@ -19,6 +19,39 @@ PROMPT_CONTEXTO_UAGRM = (
     "UAGRM, Activo Fijo, FICCT, DUAF, revalúo técnico, baja patrimonial, "
     "inventario, computadora, proyector, escritorio, código patrimonial, bolivianos."
 )
+PROMPT_CONTEXTO_INSPECCION_MOVIL = (
+    "Inspección física UAGRM: estado bueno, regular o malo, sin novedad, rayado, roto, "
+    "abollado, falta una pata, le cambiaron el color, no enciende, pantalla dañada, "
+    "enviar, aceptar, confirmar, guardar, listo, cancelar."
+)
+
+_ALUCINACIONES_WHISPER_RE = re.compile(
+    r"^(?:"
+    r"[\s.,!?;:\-–—…\"'()\[\]*]+|"
+    r"(?:\[|\()(?:m[uú]sica|music|aplausos|risas|silencio|viento|ruido|ladrido|tos|suspiro)(?:\]|\))|"
+    r"gracias\s+por\s+ver(?:\s+el\s+video)?|"
+    r"subt[ií]tulos\s+(?:realizados|hechos|por)\b.*|"
+    r"suscr[ií]bete\b.*|"
+    r"amara\.org.*|"
+    r"thank\s+you(?:\s+for\s+watching)?|"
+    r"you|bye|mbc\b.*"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _es_segmento_ruido_o_alucinacion(seg: Any, texto_seg: str) -> bool:
+    limpio = texto_seg.strip()
+    if not limpio:
+        return True
+    no_speech = getattr(seg, "no_speech_prob", 0.0)
+    avg_logprob = getattr(seg, "avg_logprob", 0.0)
+    if isinstance(no_speech, (int, float)) and no_speech > 0.62:
+        return True
+    if isinstance(avg_logprob, (int, float)) and avg_logprob < -1.35:
+        return True
+    norm = re.sub(r"[.!?¡¿\"']+", "", limpio).strip()
+    return bool(_ALUCINACIONES_WHISPER_RE.match(limpio) or (norm and _ALUCINACIONES_WHISPER_RE.match(norm)))
 
 _MAP_FORMATOS_AV: dict[str, str] = {
     "webm": "webm",
@@ -183,34 +216,65 @@ class ServicioTranscripcionVoz:
         self,
         audio_pcm: np.ndarray,
         idioma: str = "es",
+        modo_inspeccion: bool = False,
     ) -> ResultadoTranscripcionVoz:
         inicio = time.perf_counter()
         duracion_seg = round(float(audio_pcm.size) / FRECUENCIA_MUESTREO_WHISPER, 2)
+        idioma_corto = (idioma or "es").split("-")[0].lower() or "es"
 
         if audio_pcm.size < 1_600:
             return ResultadoTranscripcionVoz(
                 texto="",
-                idioma_detectado=(idioma or "es").split("-")[0].lower(),
+                idioma_detectado=idioma_corto,
                 duracion_audio_seg=duracion_seg,
                 modelo=f"whisper-{self._nombre_modelo}-int8",
                 motor_utilizado="faster_whisper_local",
                 tiempo_ms=int((time.perf_counter() - inicio) * 1000),
             )
 
-        idioma_corto = (idioma or "es").split("-")[0].lower() or "es"
+        # En ejecución real (sin modelo de prueba inyectado), omite silencio puro antes de invocar Whisper.
+        if self._modelo_inyectado is None and audio_pcm.size > 0:
+            rms = float(np.sqrt(np.mean(np.square(audio_pcm, dtype=np.float32))))
+            if rms < 0.0025:
+                return ResultadoTranscripcionVoz(
+                    texto="",
+                    idioma_detectado=idioma_corto,
+                    duracion_audio_seg=duracion_seg,
+                    modelo=f"whisper-{self._nombre_modelo}-int8",
+                    motor_utilizado="faster_whisper_local",
+                    tiempo_ms=int((time.perf_counter() - inicio) * 1000),
+                )
+
         motor = self._motor()
-        segmentos, info = motor.transcribe(
-            audio_pcm,
-            language=idioma_corto,
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            vad_filter=False,
-            condition_on_previous_text=False,
-            without_timestamps=True,
-            initial_prompt=PROMPT_CONTEXTO_UAGRM,
-        )
-        partes = [str(seg.text or "").strip() for seg in segmentos if str(seg.text or "").strip()]
+        prompt_inicial = PROMPT_CONTEXTO_INSPECCION_MOVIL if modo_inspeccion else PROMPT_CONTEXTO_UAGRM
+        usar_vad = self._modelo_inyectado is None
+        kwargs_transcribe: dict[str, Any] = {
+            "language": idioma_corto,
+            "beam_size": 1,
+            "best_of": 1,
+            "temperature": 0.0,
+            "vad_filter": usar_vad,
+            "no_speech_threshold": 0.58,
+            "log_prob_threshold": -1.1,
+            "compression_ratio_threshold": 2.2,
+            "condition_on_previous_text": False,
+            "without_timestamps": True,
+            "initial_prompt": prompt_inicial,
+        }
+        if usar_vad:
+            kwargs_transcribe["vad_parameters"] = {
+                "threshold": 0.45,
+                "min_speech_duration_ms": 160,
+                "min_silence_duration_ms": 300,
+                "speech_pad_ms": 140,
+            }
+
+        segmentos, info = motor.transcribe(audio_pcm, **kwargs_transcribe)
+        partes = [
+            str(getattr(seg, "text", "") or "").strip()
+            for seg in segmentos
+            if not _es_segmento_ruido_o_alucinacion(seg, str(getattr(seg, "text", "") or ""))
+        ]
         texto_final = " ".join(partes).strip()
 
         return ResultadoTranscripcionVoz(

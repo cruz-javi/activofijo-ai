@@ -163,3 +163,14 @@ def test_endpoint_con_override_de_servicio_mock(tmp_path: Path) -> None:
     )
     assert resp.status_code == 200
     assert resp.json()["codigo_principal"] == "ACT-001"
+
+
+def test_extractor_repara_confusion_ocr_numerica_sin_tocar_palabras() -> None:
+    bloques = [
+        ([[10, 10], [180, 10], [180, 35], [10, 35]], "BOLLOS", 0.99),
+        ([[10, 50], [220, 50], [220, 85], [10, 85]], "U01 OOO045", 0.90),
+    ]
+    resultado = extraer_codigos_de_bloques(bloques, prefijos_conocidos=["U01"])
+    assert "U01000045" in resultado.candidatos
+    assert "BOLLOS" not in resultado.candidatos
+    assert "801105" not in resultado.candidatos

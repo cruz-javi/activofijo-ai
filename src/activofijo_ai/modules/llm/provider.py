@@ -86,6 +86,7 @@ class OpenAICompatibleLlmClient:
         tool_choice: str | None = None,
         timeout_override: float | None = None,
         max_tokens_override: int | None = None,
+        temperature_override: float | None = None,
     ) -> ResultadoChatLlm:
         """Envía una solicitud Chat Completions (con soporte tool_calls ReAct) al proveedor LLM."""
         api_key = self._settings.llm_api_key.strip()
@@ -111,7 +112,7 @@ class OpenAICompatibleLlmClient:
                 "model": modelo,
                 "messages": mensajes,
                 "max_tokens": max_tokens_override or self._settings.llm_max_tokens,
-                "temperature": 0.1,
+                "temperature": 0.1 if temperature_override is None else temperature_override,
             }
             if response_format is not None and not tools:
                 payload["response_format"] = response_format

@@ -47,6 +47,27 @@ def _solo_alfanumerico(texto: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", texto.upper())
 
 
+_REEMPLAZO_OCR_DIGITO = str.maketrans({"O": "0", "Q": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2"})
+
+
+def _variante_ocr_numerica(visible: str) -> str | None:
+    """
+    Repara confusiones visuales típicas en el tramo numérico de códigos patrimoniales
+    (ej. 'U01-OOO45' -> 'U01-00045', 'AF-00I20' -> 'AF-00120') preservando el prefijo alfabético.
+    """
+    m = re.match(r"^([A-Z]{0,3}[0-9A-Z]*?[- ]?)([0-9OILSBZQ]{3,})$", visible)
+    if not m:
+        return None
+    prefijo, cuerpo = m.group(1), m.group(2)
+    if not any(ch.isdigit() for ch in f"{prefijo}{cuerpo}"):
+        return None
+    cuerpo_rep = cuerpo.translate(_REEMPLAZO_OCR_DIGITO)
+    if cuerpo_rep == cuerpo or not cuerpo_rep.isdigit():
+        return None
+    reparado = f"{prefijo}{cuerpo_rep}"
+    return reparado if reparado != visible else None
+
+
 def _contar_digitos(texto: str) -> int:
     return sum(1 for ch in texto if ch.isdigit())
 
@@ -119,10 +140,17 @@ def extraer_codigos_de_bloques(
 
     for idx, (token, score) in enumerate(tokens_con_score):
         registrar(token, score)
+        variante = _variante_ocr_numerica(_limpiar_codigo(token))
+        if variante:
+            registrar(variante, score, bono=-0.02)
         if idx + 1 < len(tokens_con_score):
             sig_token, sig_score = tokens_con_score[idx + 1]
+            unido = f"{token}{sig_token}"
             # Une pares separados por espacio típico en trazos manuales (ej. "U01 000045").
-            registrar(f"{token}{sig_token}", min(score, sig_score), bono=0.02)
+            registrar(unido, min(score, sig_score), bono=0.02)
+            variante_unida = _variante_ocr_numerica(_limpiar_codigo(unido))
+            if variante_unida:
+                registrar(variante_unida, min(score, sig_score), bono=-0.01)
 
     ranking = sorted(
         candidatos_puntaje.values(),

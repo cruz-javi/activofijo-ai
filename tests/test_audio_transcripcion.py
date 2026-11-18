@@ -110,18 +110,63 @@ class _WhisperInspeccionFake:
 
 def test_interpretar_inspeccion_voz_casos_campo(tmp_path: Path) -> None:
     casos = [
-        ("esta en buen esta", "BUENO", "", "completar", False),
-        ("esta en mal estado le falta una pata a la mesa", "MALO", "Le falta una pata a la mesa", "completar", False),
-        ("le cambiaron el color", None, "Le cambiaron el color", "completar", False),
-        ("enviar", None, "", "confirmar", True),
-        ("aceptar", None, "", "confirmar", True),
-        ("confirmar y guardar", None, "", "confirmar", True),
-        ("cancelar", None, "", "cancelar", False),
-        ("regular, raspado en esquina", "REGULAR", "Raspado en esquina", "completar", False),
+        ("esta en buen esta", "dictado_inicial", None, "BUENO", "", "completar", False),
+        (
+            "esta en mal estado le falta una pata a la mesa",
+            "dictado_inicial",
+            "MESA DE MADERA",
+            "MALO",
+            "Le falta una pata a la mesa",
+            "completar",
+            False,
+        ),
+        (
+            "le falta una pasta",
+            "dictado_inicial",
+            "MESA DE MADERA",
+            "MALO",
+            "Le falta una pata",
+            "completar",
+            False,
+        ),
+        (
+            "no aprende",
+            "dictado_inicial",
+            "PROYECTOR EPSON",
+            "MALO",
+            "No enciende",
+            "completar",
+            False,
+        ),
+        ("le cambiaron el color", "dictado_inicial", None, None, "Le cambiaron el color", "completar", False),
+        ("enviar", "dictado_inicial", None, None, "", "confirmar", True),
+        ("aceptar", "dictado_inicial", None, None, "", "confirmar", True),
+        ("confirmar y guardar", "dictado_inicial", None, None, "", "confirmar", True),
+        ("ya está todo correcto por favor mándalo de una vez", "dictado_inicial", None, None, "", "confirmar", True),
+        ("sí así déjalo y guárdalo", "esperando_confirmacion", None, None, "", "confirmar", True),
+        ("sí, está bien, mándalo", "esperando_confirmacion", None, None, "", "confirmar", True),
+        ("listo hermano envíalo nomás", "esperando_confirmacion", None, None, "", "confirmar", True),
+        ("buenos días", "dictado_inicial", None, None, "", "ignorar", False),
+        ("¿Hola, cómo estás?", "dictado_inicial", None, None, "", "ignorar", False),
+        ("un ratito espérame ingeniero", "dictado_inicial", None, None, "", "ignorar", False),
+        ("oye Juan pásame mi mochila que hace frío", "dictado_inicial", "MESA DE MADERA", None, "", "ignorar", False),
+        ("¿a qué hora vamos a ir a almorzar hoy?", "dictado_inicial", "PROYECTOR EPSON", None, "", "ignorar", False),
+        ("mañana tengo que comprar pan en el mercado", "dictado_inicial", "SILLA GIRATORIA", None, "", "ignorar", False),
+        (
+            "hola María cómo estás, tiene una esquina astillada",
+            "dictado_inicial",
+            "MESA DE MADERA",
+            None,
+            "Tiene una esquina astillada",
+            "completar",
+            False,
+        ),
+        ("buenos días, regular, raspado en esquina", "dictado_inicial", None, "REGULAR", "Raspado en esquina", "completar", False),
+        ("cancelar", "dictado_inicial", None, None, "", "cancelar", False),
     ]
 
     settings = Settings(env="test", ai_internal_api_key=CLAVE_TEST, models_dir=tmp_path)
-    for texto_dicho, est_esp, obs_esp, accion_esp, conf_esp in casos:
+    for texto_dicho, etapa, desc_activo, est_esp, obs_esp, accion_esp, conf_esp in casos:
         app = create_app()
         app.dependency_overrides[get_settings] = lambda s=settings: s
         app.dependency_overrides[get_servicio_transcripcion_voz] = lambda t=texto_dicho: ServicioTranscripcionVoz(
@@ -136,6 +181,8 @@ def test_interpretar_inspeccion_voz_casos_campo(tmp_path: Path) -> None:
                     "audio_base64": _wav_base64(0.6),
                     "mime_type": "audio/wav",
                     "idioma": "es-BO",
+                    "etapa_modal": etapa,
+                    **({"activo_descripcion": desc_activo} if desc_activo else {}),
                 },
             )
         assert res.status_code == 200
@@ -145,3 +192,97 @@ def test_interpretar_inspeccion_voz_casos_campo(tmp_path: Path) -> None:
         assert body["accion"] == accion_esp
         assert body["confirma_directo"] is conf_esp
         assert body["motor_interpretacion"] == "reglas_rapidas"
+
+
+def test_audio_filtra_alucinaciones_y_alta_probabilidad_no_habla() -> None:
+    @dataclass
+    class _SegMeta:
+        text: str
+        no_speech_prob: float = 0.0
+        avg_logprob: float = -0.2
+
+    class _WhisperRuidoFake:
+        def transcribe(self, audio, **_kwargs):
+            return [
+                _SegMeta(text="[ladrido]", no_speech_prob=0.1),
+                _SegMeta(text="Gracias por ver el video", no_speech_prob=0.2),
+                _SegMeta(text="texto fantasma viento", no_speech_prob=0.88),
+            ], _InfoFake()
+
+    servicio = ServicioTranscripcionVoz(nombre_modelo="base", modelo_inyectado=_WhisperRuidoFake())
+    import numpy as np
+
+    resultado = servicio.transcribir(np.zeros(4000, dtype=np.float32), "es", modo_inspeccion=True)
+    assert resultado.texto == ""
+
+
+def test_observacion_larga_se_resume_concisamente() -> None:
+    from activofijo_ai.modules.audio.inspeccion_nlp import (
+        ContextoInspeccionVoz,
+        interpretar_inspeccion_rapida,
+    )
+
+    res = interpretar_inspeccion_rapida(
+        "eh este mira el mueble parece que está en mal estado porque tiene un golpe fuerte en el borde derecho y le falta una pata trasera y por favor mándalo",
+        ContextoInspeccionVoz(activo_descripcion="ESCRITORIO DE MADERA"),
+    )
+    assert res.accion == "completar"
+    assert res.estado_fisico == "MALO"
+    assert 3 <= len(res.observacion.split()) <= 12
+    assert "eh" not in res.observacion.lower().split()
+
+
+async def test_respaldo_llm_inyecta_solo_skills_moviles_y_contexto(tmp_path: Path) -> None:
+    import json
+
+    import httpx
+
+    from activofijo_ai.modules.audio.inspeccion_nlp import (
+        ContextoInspeccionVoz,
+        interpretar_inspeccion_con_respaldo_ia,
+    )
+
+    prompts_capturados: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        prompts_capturados.append(body["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={
+                "model": "uagrm-activo-fijo",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "accion": "completar",
+                                    "estado_fisico": "REGULAR",
+                                    "observacion": "Tornillo suelto en soporte",
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 42},
+            },
+        )
+
+    settings = Settings(env="test", ai_internal_api_key=CLAVE_TEST, models_dir=tmp_path)
+    res = await interpretar_inspeccion_con_respaldo_ia(
+        "creo que se le salió un tornillito y baila un poco",
+        settings,
+        ContextoInspeccionVoz(
+            etapa_modal="dictado_inicial",
+            activo_codigo="U01000045",
+            activo_descripcion="MESA DE MADERA",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    assert res.motor_interpretacion == "llm_local"
+    assert res.accion == "completar"
+    assert res.estado_fisico == "REGULAR"
+    assert res.observacion == "Tornillo suelto en soporte"
+    assert len(prompts_capturados) == 1
+    assert 'Responde SOLO JSON: {"a":' in prompts_capturados[0]
+    assert "cartas" not in prompts_capturados[0].lower()

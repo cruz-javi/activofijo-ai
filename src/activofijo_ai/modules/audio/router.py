@@ -10,6 +10,7 @@ from activofijo_ai.modules.audio.engine import (
     decodificar_audio_en_ram,
 )
 from activofijo_ai.modules.audio.inspeccion_nlp import (
+    ContextoInspeccionVoz,
     interpretar_inspeccion_con_respaldo_ia,
 )
 from activofijo_ai.modules.audio.schemas import (
@@ -89,8 +90,15 @@ async def interpretar_inspeccion_voz(
             },
         ) from exc
 
-    trans = servicio.transcribir(audio_pcm, payload.idioma)
-    interpretacion = await interpretar_inspeccion_con_respaldo_ia(trans.texto, settings)
+    trans = servicio.transcribir(audio_pcm, payload.idioma, modo_inspeccion=True)
+    contexto = ContextoInspeccionVoz(
+        etapa_modal=payload.etapa_modal,
+        activo_codigo=payload.activo_codigo,
+        activo_descripcion=payload.activo_descripcion,
+        estado_actual=payload.estado_actual,
+        observacion_actual=payload.observacion_actual,
+    )
+    interpretacion = await interpretar_inspeccion_con_respaldo_ia(trans.texto, settings, contexto)
     return InterpretarInspeccionVozResponse(
         texto_transcrito=trans.texto,
         estado_fisico=interpretacion.estado_fisico,
