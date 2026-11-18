@@ -232,6 +232,87 @@ CONDICIONES_PADRON_VALIDAS: frozenset[str] = frozenset(
     {"NUEVO", "USADO", "DETERIORADO", "BUENO", "REGULAR", "MALO"}
 )
 
+_PALABRAS_NO_SEARCH: frozenset[str] = frozenset(
+    {
+        "de", "del", "la", "las", "el", "los", "lo", "un", "una", "unos", "unas",
+        "en", "por", "para", "con", "sin", "sobre", "entre", "desde", "hasta", "hacia",
+        "y", "o", "u", "a", "al", "que", "cual", "cuales", "cuanto", "cuantos", "cuanta",
+        "hay", "son", "estan", "esta", "este", "estos", "estas", "ese", "esa", "solo", "solamente",
+        "todos", "todas", "todo", "toda", "tengan", "tenga", "tiene", "tienen", "sea", "sean",
+        "quiero", "necesito", "dame", "muestrame", "mostrar", "ver", "lista", "listado",
+        "genera", "generar", "haz", "hazme", "saca", "sacar", "busca", "buscar", "filtralo",
+        "filtra", "filtrar", "reporte", "reportes", "informe", "informes", "consulta", "padron",
+        "inventario", "activo", "activos", "bien", "bienes", "equipo", "equipos", "item", "items",
+        "vehiculo", "vehiculos", "mueble", "muebles", "enseres", "computadora", "computadoras",
+        "laptop", "laptops", "portatil", "portatiles", "pc", "maquinaria", "herramienta", "herramientas", "edificacion", "edificaciones", "inmueble",
+        "inmuebles", "terreno", "terrenos", "semoviente", "semovientes", "animal", "animales",
+        "estado", "estados", "condicion", "condiciones", "bueno", "buenos", "buen", "buena",
+        "buenas", "regular", "regulares", "malo", "malos", "mal", "mala", "malas",
+        "reparacion", "mantenimiento", "baja", "bajas", "dado", "dados", "desincorporado",
+        "nuevo", "nuevos", "nueva", "nuevas", "usado", "usados", "usada", "usadas",
+        "deteriorado", "deteriorados", "deteriorada", "deterioradas", "inservible", "inservibles",
+        "inutilizado", "inutilizados", "danado", "danados", "averiado", "averiados",
+        "unidad", "oficina", "facultad", "departamento", "dependencia", "sede", "area", "campus",
+        "ciencias", "exactas", "tecnologia", "salud", "humana", "administrativa", "financiera",
+        "veterinaria", "veterinarias", "computacion", "telecomunicaciones", "valor", "monto",
+        "precio", "costo", "bs", "boliviano", "bolivianos", "mayor", "mayores", "menor", "menores",
+        "superior", "superiores", "inferior", "inferiores", "mas", "menos", "gestion", "ano",
+        "anio", "marca", "tipo", "exporta", "exportar", "exportalo", "descarga", "descargar",
+        "descargalo", "imprime", "imprimir", "formato", "formatos", "pdf", "excel", "xlsx",
+        "word", "docx", "csv", "grafica", "graficas", "grafico", "graficos", "tres", "ahora",
+        "ficct", "daf", "duaf", "rectorado", "vicerrectorado", "biblioteca", "medicina", "prado",
+        "yabare", "decanato", "auditorio", "postgrado", "derecho", "economia", "humanidades",
+        "camiri", "montero", "vallecito", "cpd", "almacen",
+    }
+)
+
+
+def _extraer_termino_busqueda_residual(norm: str) -> str | None:
+    for tk in re.findall(r"[a-z0-9]{3,}", norm):
+        if tk.isdigit() or tk in _PALABRAS_NO_SEARCH:
+            continue
+        if len(tk) >= 5 and tk.endswith("s") and not tk.endswith("ss"):
+            base = tk[:-1]
+            if base in _PALABRAS_NO_SEARCH:
+                continue
+            return base.upper()
+        return tk.upper()
+    return None
+
+
+def _resolver_search_consulta(consulta_usuario: str, norm: str) -> str | None:
+    m_cod = re.search(
+        r"\b([a-z]\d{6,10}|\d{4}-\d{2}-\d{3,6})\b",
+        consulta_usuario,
+        flags=re.IGNORECASE,
+    )
+    if m_cod:
+        return m_cod.group(1).upper()
+
+    for palabra_clave in (
+        "aire acondicionado",
+        "proyector",
+        "impresora",
+        "microscopio",
+        "servidor",
+        "camioneta",
+        "escritorio",
+        "estante",
+        "archivador",
+        "fotocopiadora",
+        "scanner",
+        "silla",
+        "mesa",
+        "monitor",
+        "ups",
+        "pizarra",
+    ):
+        if re.search(rf"\b{re.escape(palabra_clave)}(?:s|es)?\b", norm):
+            return palabra_clave.upper()
+
+    return _extraer_termino_busqueda_residual(norm)
+
+
 _ALIAS_UBICACIONES: tuple[tuple[str, str], ...] = (
     ("ficct", "FICCT"),
     ("facultad de ciencias veterinarias", "Veterinarias"),
@@ -424,27 +505,7 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
     if m_anio:
         gestion = int(m_anio.group(1))
 
-    search: str | None = None
-    m_cod = re.search(r"\b([a-z]\d{6,10}|\d{4}-\d{2}-\d{3,6})\b", consulta_usuario, flags=re.IGNORECASE)
-    if m_cod:
-        search = m_cod.group(1).upper()
-    else:
-        for palabra_clave in (
-            "aire acondicionado",
-            "proyector",
-            "impresora",
-            "microscopio",
-            "servidor",
-            "camioneta",
-            "escritorio",
-            "fotocopiadora",
-            "scanner",
-            "ups",
-            "pizarra",
-        ):
-            if re.search(rf"\b{re.escape(palabra_clave)}(?:s|es)?\b", norm):
-                search = palabra_clave.upper()
-                break
+    search = _resolver_search_consulta(consulta_usuario, norm)
 
     return {
         "search": search,
@@ -922,13 +983,27 @@ async def obtener_estadisticas_padron(
         str | None,
         Field(description="Solo oficina/facultad exacta; null si es global"),
     ] = None,
+    search: str | None = None,
+    estado: str | None = None,
+    condicion: str | None = None,
+    grupo_contable: str | None = None,
+    valor_min: float | None = None,
+    valor_max: float | None = None,
+    gestion: int | None = None,
 ) -> dict[str, Any]:
-    """Obtiene conteos exactos y sumatoria total en Bs. del padrón PostgreSQL UAGRM por estado, condición y grupo."""
+    """Obtiene conteos exactos y sumatoria total en Bs. del padrón PostgreSQL UAGRM filtrados por criterios."""
     cliente, seg = _obtener_cliente_y_seguridad()
     return await cliente.post_internal(
         "estadisticas-padron",
         {
             "unidad": _normalizar_unidad_stats(unidad),
+            "search": _normalizar_param_opcional(search),
+            "estado": _normalizar_param_opcional(estado),
+            "condicion": _normalizar_param_opcional(condicion),
+            "grupoContable": _normalizar_param_opcional(grupo_contable),
+            "valorMin": valor_min,
+            "valorMax": valor_max,
+            "gestion": gestion,
             "seguridad": seg,
         },
     )

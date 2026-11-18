@@ -556,6 +556,28 @@ def test_sesion_temporal_hereda_filtros_reporte_y_refina_carta(tmp_path: Path) -
     assert body_carta["cuerpo_parrafos"][0] == "Párrafo inicial de prueba."
     assert "sobrecarga electrica" in body_carta["cuerpo_parrafos"][1].lower()
 
+    # Residual keyword extraction for brands / specific nouns without broad generic leakage
+    res_marca = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "laptops Lenovo de FICCT",
+            "modulo": "reportes",
+        },
+    )
+    assert res_marca.status_code == 200
+    body_marca = res_marca.json()
+    assert body_marca["filtros_detectados"]["grupo_contable"] == "Equipos de Computación"
+    assert body_marca["filtros_detectados"]["ubicacion"] == "FICCT"
+    assert body_marca["filtros_detectados"]["search"] == "LENOVO"
+    traza_filtro = next(
+        (t for t in body_marca["trazas_mcp"] if t["herramienta"] == "filtrar_catalogo_reportes"),
+        None,
+    )
+    assert traza_filtro is not None
+    assert "LENOVO" in traza_filtro["resumen_resultado"]
+    assert "FICCT" in traza_filtro["resumen_resultado"]
+
     # Ayuda IA cuantitativa consulta padrón real y multi-rol admin
     res_ayuda_cnt = client.post(
         "/v1/llm/asistente-sistema",

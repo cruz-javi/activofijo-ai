@@ -207,8 +207,29 @@ def _resumir_observacion_tool(nombre_tool: str, obs: dict[str, Any]) -> str:
         enlaces = obs.get("enlaces_directos") or []
         return f"{len(enlaces)} módulo(s) autorizados verificados"
     if nombre_tool == "filtrar_catalogo_reportes":
-        activos = [k for k, v in obs.items() if v is not None]
-        return f"{len(activos)} criterio(s) identificados" if activos else "Consulta general"
+        etiquetas_campos = (
+            ("search", "Búsqueda"),
+            ("estado", "Estado"),
+            ("condicion", "Condición"),
+            ("grupo_contable", "Grupo"),
+            ("ubicacion", "Unidad"),
+            ("valor_min", "Valor mín."),
+            ("valor_max", "Valor máx."),
+            ("gestion", "Gestión"),
+        )
+        partes: list[str] = []
+        for campo, titulo in etiquetas_campos:
+            val = obs.get(campo)
+            if val is None or val == "":
+                continue
+            if campo in ("valor_min", "valor_max"):
+                partes.append(f"{titulo}: {formatear_bs(val)}")
+            else:
+                partes.append(f"{titulo}: {val}")
+        if not partes:
+            return "Sin criterios restrictivos (consulta general)"
+        pref = "1 criterio" if len(partes) == 1 else f"{len(partes)} criterios"
+        return f"{pref}: " + " · ".join(partes)
     if nombre_tool == "consultar_ficha_activo":
         cod = obs.get("codigo")
         return f"Ficha {cod} validada" if cod else "Datos de ficha preparados"
@@ -322,6 +343,7 @@ class McpBridgeService:
         nombres_tools: set[str],
         max_iteraciones: int = 4,
         emitir_evento: EmitirEventoFn | None = None,
+        tool_args_override: dict[str, dict[str, Any]] | None = None,
     ) -> tuple[str, str, int, list[TrazaHerramientaMcp], dict[str, dict[str, Any]]]:
         openai_tools = await self._tools_openai_desde_mcp(nombres_tools)
         mensajes = list(mensajes_iniciales)
@@ -415,6 +437,10 @@ class McpBridgeService:
                             args = {}
                     except json.JSONDecodeError:
                         args = {}
+                    if tool_args_override and tc.nombre in tool_args_override:
+                        for k_ov, v_ov in tool_args_override[tc.nombre].items():
+                            if v_ov is not None:
+                                args[k_ov] = v_ov
                     clave_dedup = f"{tc.nombre}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
                     if clave_dedup in cache_ronda:
                         obs = cache_ronda[clave_dedup]
@@ -986,22 +1012,12 @@ class McpBridgeService:
             elif payload.consultar_padron_real:
                 busq_obs, traza_b = await self._llamar_tool_con_traza(
                     "buscar_activos_padron",
-                    {
-                        "search": filtros_det.search,
-                        "unidad": filtros_det.ubicacion,
-                        "estado": filtros_det.estado,
-                        "condicion": filtros_det.condicion,
-                        "grupo_contable": filtros_det.grupo_contable,
-                        "valor_min": filtros_det.valor_min,
-                        "valor_max": filtros_det.valor_max,
-                        "gestion": filtros_det.gestion,
-                        "limit": 10,
-                    },
+                    self._args_padron_desde_filtros(filtros_det, limit=10),
                 )
                 trazas_mcp.append(traza_b)
                 stats_obs, traza_s = await self._llamar_tool_con_traza(
                     "obtener_estadisticas_padron",
-                    {"unidad": filtros_det.ubicacion},
+                    self._args_padron_desde_filtros(filtros_det),
                 )
                 trazas_mcp.append(traza_s)
                 if busq_obs.get("ok") is not False:
@@ -1106,6 +1122,23 @@ class McpBridgeService:
         finally:
             core_bridge_ctx.reset(tok_cli)
             seguridad_mcp_ctx.reset(tok_seg)
+
+    def _args_padron_desde_filtros(
+        self, f: FiltrosDetectadosReporte, limit: int | None = None
+    ) -> dict[str, Any]:
+        args: dict[str, Any] = {
+            "search": f.search,
+            "unidad": f.ubicacion,
+            "estado": f.estado,
+            "condicion": f.condicion,
+            "grupo_contable": f.grupo_contable,
+            "valor_min": f.valor_min,
+            "valor_max": f.valor_max,
+            "gestion": f.gestion,
+        }
+        if limit is not None:
+            args["limit"] = limit
+        return args
 
     def _combinar_filtros(
         self, base: FiltrosDetectadosReporte, raw: dict[str, Any]
@@ -1244,7 +1277,7 @@ class McpBridgeService:
                 trazas_mcp.append(traza_b)
                 stats_ayuda, traza_s = await self._llamar_tool_con_traza(
                     "obtener_estadisticas_padron",
-                    {"unidad": filtros_nav.ubicacion},
+                    self._args_padron_desde_filtros(filtros_nav),
                     emitir_evento=emitir_evento,
                 )
                 trazas_mcp.append(traza_s)
@@ -1463,17 +1496,28 @@ class McpBridgeService:
                 "consultar_reglas_normativas",
             }
 
+            args_stats_det = self._args_padron_desde_filtros(filtros_det)
+            args_busqueda_det = self._args_padron_desde_filtros(filtros_det, limit=12)
+            enforced_tool_args = {
+                "buscar_activos_padron": args_busqueda_det,
+                "obtener_estadisticas_padron": args_stats_det,
+            }
+
             if settings.env != "test" or self._transport is not None:
                 try:
+                    criterios_obligatorios = {
+                        k: v for k, v in args_stats_det.items() if v is not None
+                    }
                     mensajes: list[dict[str, Any]] = [
                         {
                             "role": "system",
                             "content": (
                                 "Agente Analítico Patrimonial UAGRM. Consulta fuentes vía herramientas "
-                                "(usa los estados reales del padrón: BUENO, REGULAR, MALO, EN_REPARACION, BAJA; "
-                                "condiciones: NUEVO, USADO, DETERIORADO; deja 'unidad' en null salvo facultad/oficina concreta). "
-                                "Sintetiza hallazgos ejecutivos precisos con cifras exactas en español boliviano y moneda Bs., "
-                                "sin inventar datos."
+                                "aplicando ESTRICTAMENTE los criterios solicitados "
+                                f"({json.dumps(criterios_obligatorios, ensure_ascii=False)}). "
+                                "Usa los estados reales (BUENO, REGULAR, MALO, EN_REPARACION, BAJA) y "
+                                "condiciones (NUEVO, USADO, DETERIORADO). Sintetiza únicamente información "
+                                "de los bienes coincidentes en español boliviano y moneda Bs.; si hay 0 coincidencias, indícalo claramente."
                             ),
                         },
                     ]
@@ -1503,6 +1547,7 @@ class McpBridgeService:
                             nombres_tools=tools_analitica,
                             max_iteraciones=2,
                             emitir_evento=emitir_evento,
+                            tool_args_override=enforced_tool_args,
                         )
                     )
                     trazas_mcp.extend(trazas_react)
@@ -1517,23 +1562,16 @@ class McpBridgeService:
                         respuesta_llm = normalizar_moneda_texto(contenido.strip())
                         motor_usado, _ = _resolver_motor(settings)
                 except (LlmNoConfiguradoError, LlmErrorExternoError):
-                    pass
+                    obs = {}
+            else:
+                obs = {}
 
-            # Asegura anclaje real si el modelo omitió alguna consulta necesaria o estuvo offline
-            if not activos_mencionados:
+            # Garantiza anclaje real filtrado incluso si el LLM omitió consultar alguna herramienta DB
+            busco_db = "buscar_activos_padron" in obs and obs["buscar_activos_padron"].get("ok") is not False
+            if not busco_db:
                 busq_obs, traza_b = await self._llamar_tool_con_traza(
                     "buscar_activos_padron",
-                    {
-                        "search": filtros_det.search,
-                        "unidad": filtros_det.ubicacion,
-                        "estado": filtros_det.estado,
-                        "condicion": filtros_det.condicion,
-                        "grupo_contable": filtros_det.grupo_contable,
-                        "valor_min": filtros_det.valor_min,
-                        "valor_max": filtros_det.valor_max,
-                        "gestion": filtros_det.gestion,
-                        "limit": 12,
-                    },
+                    args_busqueda_det,
                     emitir_evento=emitir_evento,
                 )
                 trazas_mcp.append(traza_b)
@@ -1546,7 +1584,7 @@ class McpBridgeService:
             if estadisticas is None:
                 stats_obs, traza_s = await self._llamar_tool_con_traza(
                     "obtener_estadisticas_padron",
-                    {"unidad": filtros_det.ubicacion},
+                    args_stats_det,
                     emitir_evento=emitir_evento,
                 )
                 trazas_mcp.append(traza_s)
@@ -1554,29 +1592,36 @@ class McpBridgeService:
                     estadisticas = stats_obs
 
             if not respuesta_llm:
-                total_padron = (estadisticas or {}).get("totalActivos", 0)
-                valor_padron = formatear_bs((estadisticas or {}).get("valorTotalBs", 0))
+                total_filtrados = (estadisticas or {}).get("totalActivos", total_coincidencias_db)
+                valor_filtrados = formatear_bs((estadisticas or {}).get("valorTotalBs", 0))
                 valor_muestra = formatear_bs(
                     sum(float(a.get("valorBs") or 0) for a in activos_mencionados)
                 )
-                coinc = total_coincidencias_db or len(activos_mencionados)
+                coinc = total_filtrados or total_coincidencias_db or len(activos_mencionados)
                 por_est = [
                     f"{e.get('estado')}: {e.get('cantidad')}"
                     for e in ((estadisticas or {}).get("porEstado") or [])[:4]
                     if isinstance(e, dict)
                 ]
-                resumen_estados = f" Distribución por estado: {', '.join(por_est)}." if por_est else ""
+                resumen_estados = f" Distribución: {', '.join(por_est)}." if por_est else ""
                 nota_export = (
                     f" Exportación preparada automáticamente en formato(s): {', '.join(f.upper() for f in formatos_exportacion)}."
                     if formatos_exportacion
                     else ""
                 )
-                respuesta_llm = (
-                    f"Análisis patrimonial verificado en PostgreSQL UAGRM ({self._explicar_filtros(filtros_det).rstrip('.')}): "
-                    f"se identificaron {coinc} activo(s) coincidente(s) (muestra valorada en {valor_muestra}). "
-                    f"El universo consultado contabiliza {total_padron} bien(es) por un monto acumulado de {valor_padron}."
-                    f"{resumen_estados}{nota_export}"
-                )
+                if coinc == 0:
+                    respuesta_llm = (
+                        f"No se encontraron activos que cumplan exactamente con los criterios solicitados "
+                        f"({self._explicar_filtros(filtros_det).rstrip('.')})."
+                    )
+                else:
+                    respuesta_llm = (
+                        f"Resultado verificado exclusivamente para los criterios solicitados "
+                        f"({self._explicar_filtros(filtros_det).rstrip('.')}): "
+                        f"{coinc} bien(es) coincidente(s) por un valor acumulado de {valor_filtrados} "
+                        f"(muestra directa: {len(activos_mencionados)} registro(s), {valor_muestra})."
+                        f"{resumen_estados}{nota_export}"
+                    )
 
             return ConsultaAnaliticaResponse(
                 motor_utilizado=motor_usado,  # type: ignore[arg-type]
