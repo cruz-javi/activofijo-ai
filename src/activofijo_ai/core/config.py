@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     llm_model: str = Field(default="uagrm-activo-fijo")
     llm_timeout_seconds: float = Field(default=180.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0, le=8192)
+    llm_keep_alive: str = Field(default="25m")
+
+    # Motor de respaldo remoto opcional (ej. Groq qwen/qwen3.8-27b) si el motor local falla o agota tiempo
+    llm_fallback_provider: str = Field(default="")
+    llm_fallback_base_url: str = Field(default="https://api.groq.com/openai/v1")
+    llm_fallback_api_key: str = Field(default="")
+    llm_fallback_model: str = Field(default="qwen/qwen3.8-27b")
+    llm_fallback_timeout_seconds: float = Field(default=30.0, gt=0)
+
     whisper_model: str = Field(default="base")
 
     models_dir: Path = Field(default_factory=lambda: _ruta_raiz_proyecto() / "models")

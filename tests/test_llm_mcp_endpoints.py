@@ -781,3 +781,312 @@ def test_corrector_fonetico_whisper_y_composicion_semantica_sin_alucinar_faculta
     assert "mcp" not in unido.lower()
     # Carta extensa (>= 220 palabras formales)
     assert sum(len(p.split()) for p in body["cuerpo_parrafos"]) >= 220
+
+
+def test_reporte_dinamico_columnas_y_sin_contaminacion_search_incluya(tmp_path: Path) -> None:
+    payloads_core: list[dict] = []
+
+    async def mock_ollama_plan(_request: httpx.Request) -> httpx.Response:
+        plan = {
+            "fuente": "PADRON",
+            "ubicacion": "FICCT",
+            "estado": "MALO",
+            "search": "INCLUYA",  # Simula contaminación que debe ser blindada
+            "columnas": ["codigo", "descripcion", "custodio", "valorBs"],
+            "titulo_reporte": "REPORTE DE ACTIVOS EN MAL ESTADO — FICCT",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "model": "uagrm-activo-fijo",
+                "choices": [{"message": {"content": json.dumps(plan)}}],
+                "usage": {"total_tokens": 115},
+            },
+        )
+
+    async def mock_core_dinamico(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        payloads_core.append(body)
+        assert request.url.path == "/internal/mcp/reporte-dinamico"
+        return httpx.Response(
+            200,
+            json={
+                "fuente": "PADRON",
+                "totalRegistros": 2,
+                "valorTotalBs": 12500.0,
+                "columnasDisponibles": [
+                    {"key": "codigo", "label": "Código", "defaultVisible": True},
+                    {"key": "descripcion", "label": "Descripción del Bien", "defaultVisible": True},
+                    {"key": "custodio", "label": "Responsable / Custodio", "defaultVisible": True},
+                    {"key": "valorBs", "label": "Valor (Bs.)", "isNumeric": True, "isCurrency": True, "defaultVisible": True},
+                    {"key": "marca", "label": "Marca", "defaultVisible": False},
+                ],
+                "columnasSeleccionadas": body.get("columnas") or ["codigo", "descripcion"],
+                "filas": [
+                    {"codigo": "U04000018", "descripcion": "Proyector Epson", "custodio": "Ana Gómez", "valorBs": 4200.0},
+                    {"codigo": "U04000019", "descripcion": "Switch Cisco", "custodio": "Luis Arce", "valorBs": 8300.0},
+                ],
+                "estadisticas": {
+                    "totalActivos": 2,
+                    "valorTotalBs": 12500.0,
+                    "porEstado": [{"estado": "MALO", "cantidad": 2, "valorBs": 12500.0}],
+                    "porGrupoTop": [],
+                    "topUnidades": [],
+                },
+            },
+        )
+
+    client = _crear_cliente(
+        tmp_path,
+        transport=httpx.MockTransport(mock_ollama_plan),
+        core_transport=httpx.MockTransport(mock_core_dinamico),
+    )
+    res = client.post(
+        "/v1/llm/consulta-analitica",
+        headers={"X-AI-Internal-Key": CLAVE_TEST},
+        json={
+            "consulta": "Dame activos de la FICCT en estado malo que incluya columnas codigo, descripcion, custodio y valor",
+            "modulo": "reportes",
+            "contexto_seguridad": {"acceso_amplio": True, "rol_usuario": "ADMINISTRADOR"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ia_activa"] is True
+    assert body["motor_utilizado"] == "ollama_personalizado"
+    assert body["motivo_respaldo"] is None
+    assert body["fuente_reporte"] == "PADRON"
+    assert body["filtros_detectados"]["search"] is None
+    assert body["filtros_detectados"]["ubicacion"] == "FICCT"
+    assert body["filtros_detectados"]["estado"] == "MALO"
+    assert body["columnas_seleccionadas"] == ["codigo", "descripcion", "custodio", "valorBs"]
+    assert len(body["filas_reporte"]) == 2
+    assert payloads_core[0]["search"] is None
+    assert payloads_core[0]["unidad"] == "FICCT"
+
+
+def test_reporte_dinamico_multifuente_bajas_fechas_y_columnas(tmp_path: Path) -> None:
+    payloads_core: list[dict] = []
+
+    async def mock_ollama_bajas(_request: httpx.Request) -> httpx.Response:
+        plan = {
+            "fuente": "BAJAS",
+            "ubicacion": "Facultad de Ciencias Contables",
+            "fecha_desde": "2024-01-01",
+            "fecha_hasta": "2025-12-31",
+            "columnas": ["nroBaja", "codigo", "fechaBaja", "motivo", "valorFinalBs"],
+            "titulo_reporte": "REPORTE DE BAJAS 2024-2025 — CIENCIAS CONTABLES",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "model": "uagrm-activo-fijo",
+                "choices": [{"message": {"content": json.dumps(plan)}}],
+                "usage": {"total_tokens": 130},
+            },
+        )
+
+    async def mock_core_bajas(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        payloads_core.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "fuente": "BAJAS",
+                "totalRegistros": 1,
+                "valorTotalBs": 1.0,
+                "columnasDisponibles": [
+                    {"key": "nroBaja", "label": "Acta Baja", "defaultVisible": True},
+                    {"key": "codigo", "label": "Código", "defaultVisible": True},
+                    {"key": "fechaBaja", "label": "Fecha Baja", "isDate": True, "defaultVisible": True},
+                    {"key": "motivo", "label": "Motivo de Baja", "defaultVisible": True},
+                    {"key": "valorFinalBs", "label": "Valor Final (Bs.)", "isNumeric": True, "isCurrency": True, "defaultVisible": True},
+                ],
+                "columnasSeleccionadas": body.get("columnas"),
+                "filas": [
+                    {
+                        "nroBaja": "BAJ-2024-011",
+                        "codigo": "U03000112",
+                        "fechaBaja": "2024-08-19",
+                        "motivo": "Obsolescencia técnica R.R. 449/2013",
+                        "valorFinalBs": 1.0,
+                    }
+                ],
+                "estadisticas": {
+                    "totalActivos": 1,
+                    "valorTotalBs": 1.0,
+                    "porEstado": [{"estado": "BAJA", "cantidad": 1, "valorBs": 1.0}],
+                    "porGrupoTop": [],
+                    "topUnidades": [],
+                },
+            },
+        )
+
+    client = _crear_cliente(
+        tmp_path,
+        transport=httpx.MockTransport(mock_ollama_bajas),
+        core_transport=httpx.MockTransport(mock_core_bajas),
+    )
+    res = client.post(
+        "/v1/llm/consulta-analitica",
+        headers={"X-AI-Internal-Key": CLAVE_TEST},
+        json={
+            "consulta": "Reporte de bajas realizadas entre 2024 y 2025 en Ciencias Contables con columnas acta de baja, codigo, fecha de baja, motivo y valor final",
+            "modulo": "reportes",
+            "contexto_seguridad": {"acceso_amplio": True, "rol_usuario": "ADMINISTRADOR"},
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ia_activa"] is True
+    assert body["fuente_reporte"] == "BAJAS"
+    assert body["filtros_detectados"]["fecha_desde"] == "2024-01-01"
+    assert body["filtros_detectados"]["fecha_hasta"] == "2025-12-31"
+    assert body["filtros_detectados"]["gestion"] is None
+    assert body["columnas_seleccionadas"] == ["nroBaja", "codigo", "fechaBaja", "motivo", "valorFinalBs"]
+    assert payloads_core[0]["fuente"] == "BAJAS"
+    assert payloads_core[0]["fechaDesde"] == "2024-01-01"
+    assert payloads_core[0]["fechaHasta"] == "2025-12-31"
+
+
+def test_transparencia_ollama_apagado_reportes_y_cartas(tmp_path: Path) -> None:
+    async def mock_ollama_caido(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("Connection refused (Ollama apagado)", request=request)
+
+    async def mock_core_ok(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "fuente": "ASIGNACIONES",
+                "totalRegistros": 1,
+                "valorTotalBs": 5400.0,
+                "columnasDisponibles": [
+                    {"key": "nroActa", "label": "Nro. Acta", "defaultVisible": True},
+                    {"key": "fechaAsignacion", "label": "Fecha Asignación", "isDate": True, "defaultVisible": True},
+                    {"key": "codigo", "label": "Código Bien", "defaultVisible": True},
+                ],
+                "columnasSeleccionadas": ["nroActa", "fechaAsignacion", "codigo"],
+                "filas": [{"nroActa": "ASG-001", "fechaAsignacion": "2025-05-10", "codigo": "U04000010"}],
+                "estadisticas": {"totalActivos": 1, "valorTotalBs": 5400.0, "porEstado": [], "porGrupoTop": [], "topUnidades": []},
+            },
+        )
+
+    client = _crear_cliente(
+        tmp_path,
+        transport=httpx.MockTransport(mock_ollama_caido),
+        core_transport=httpx.MockTransport(mock_core_ok),
+    )
+    headers = {"X-AI-Internal-Key": CLAVE_TEST}
+
+    res_rep = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "Reporte de reasignaciones de la FICCT desde 2025",
+            "modulo": "reportes",
+            "contexto_seguridad": {"acceso_amplio": True, "rol_usuario": "ADMINISTRADOR"},
+        },
+    )
+    assert res_rep.status_code == 200
+    body_rep = res_rep.json()
+    assert body_rep["ia_activa"] is False
+    assert body_rep["motor_utilizado"] == "respaldo_determinista"
+    assert body_rep["motivo_respaldo"] and "Ollama" in body_rep["motivo_respaldo"]
+    assert body_rep["fuente_reporte"] == "ASIGNACIONES"
+
+    res_carta = client.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={"instruccion_usuario": "Solicito compra de 2 impresoras para la FICCT."},
+    )
+    assert res_carta.status_code == 200
+    body_carta = res_carta.json()
+    assert body_carta["ia_activa"] is False
+    assert body_carta["motor_utilizado"] == "respaldo_determinista"
+    assert body_carta["motivo_respaldo"] and "Ollama" in body_carta["motivo_respaldo"]
+
+
+def test_planificador_reporte_ignora_errores_dictado_necesitum_y_extrae_rango_anios_corto(
+    tmp_path: Path,
+) -> None:
+    def mock_ollama_dictado(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "model": "uagrm-activo-fijo",
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "fuente": "PADRON",
+                                    "ubicacion": "FICCT",
+                                    "estado": "MALO",
+                                    "search": "NECESITUM",
+                                    "gestion": "2020-25",
+                                }
+                            )
+                        }
+                    }
+                ],
+                "usage": {"total_tokens": 95},
+            },
+        )
+
+    def mock_core_dictado(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload["fuente"] == "PADRON"
+        assert payload["unidad"] == "FICCT"
+        assert payload["estado"] == "MALO"
+        assert payload["search"] is None
+        assert payload["gestion"] is None
+        assert payload["fechaDesde"] == "2020-01-01"
+        assert payload["fechaHasta"] == "2025-12-31"
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "fuente": "PADRON",
+                "totalRegistros": 18,
+                "valorTotalBs": 154200.0,
+                "columnasDisponibles": [
+                    {"key": "codigo", "label": "Código", "defaultVisible": True},
+                    {"key": "descripcion", "label": "Descripción", "defaultVisible": True},
+                ],
+                "columnasSeleccionadas": ["codigo", "descripcion"],
+                "filas": [{"codigo": "U04000101", "descripcion": "Equipo en estado malo"}],
+                "estadisticas": {
+                    "totalActivos": 18,
+                    "valorTotalBs": 154200.0,
+                    "porEstado": [{"estado": "MALO", "cantidad": 18, "valorBs": 154200.0}],
+                    "porGrupoTop": [],
+                    "topUnidades": [],
+                },
+            },
+        )
+
+    client = _crear_cliente(
+        tmp_path,
+        transport=httpx.MockTransport(mock_ollama_dictado),
+        core_transport=httpx.MockTransport(mock_core_dictado),
+    )
+    resp = client.post(
+        "/v1/llm/consulta-analitica",
+        headers={"X-AI-Internal-Key": CLAVE_TEST},
+        json={
+            "consulta": "Necesitum reporte de todos los activos en estado malo de la Facultad de Ingeniería Informática Dados de Alta en el año 2020-25.",
+            "modulo": "reportes",
+            "contexto_seguridad": {"acceso_amplio": True, "rol_usuario": "ADMINISTRADOR"},
+        },
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    filtros = body["filtros_detectados"]
+    assert filtros["fuente"] == "PADRON"
+    assert filtros["ubicacion"] == "FICCT"
+    assert filtros["estado"] == "MALO"
+    assert filtros["search"] is None
+    assert filtros["gestion"] is None
+    assert filtros["fecha_desde"] == "2020-01-01"
+    assert filtros["fecha_hasta"] == "2025-12-31"
+    assert body["total_registros"] == 18

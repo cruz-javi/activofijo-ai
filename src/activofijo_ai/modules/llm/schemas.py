@@ -65,6 +65,8 @@ class RedaccionAsistidaRequest(BaseModel):
 class RedaccionAsistidaResponse(BaseModel):
     motor_utilizado: Literal["ollama_personalizado", "llm_remoto", "respaldo_determinista"]
     modelo: str
+    ia_activa: bool = False
+    motivo_respaldo: str | None = None
     tipo_documento_detectado: TipoDocumentoCarta | None = None
     referencia: str
     lugar_fecha: str
@@ -98,14 +100,24 @@ class ConsultaLenguajeNaturalRequest(BaseModel):
 
 
 class FiltrosDetectadosReporte(BaseModel):
+    fuente: str | None = None
     search: str | None = None
     estado: str | None = None
     condicion: str | None = None
     grupo_contable: str | None = None
     ubicacion: str | None = None
+    marca: str | None = None
+    modelo: str | None = None
+    custodio: str | None = None
     valor_min: float | None = None
     valor_max: float | None = None
     gestion: int | None = None
+    fecha_desde: str | None = None
+    fecha_hasta: str | None = None
+    ordenar_por: str | None = None
+    orden_dir: str | None = None
+    limite: int | None = None
+    columnas: list[str] | None = None
 
 
 class ConsultaLenguajeNaturalResponse(BaseModel):
@@ -165,13 +177,22 @@ class ConsultaAnaliticaRequest(BaseModel):
 class ConsultaAnaliticaResponse(BaseModel):
     motor_utilizado: Literal["ollama_personalizado", "llm_remoto", "respaldo_determinista"]
     modelo: str
+    ia_activa: bool = False
+    motivo_respaldo: str | None = None
+    fuente_reporte: str = "PADRON"
+    titulo_sugerido: str | None = None
     respuesta: str
     filtros_detectados: FiltrosDetectadosReporte
+    columnas_disponibles: list[dict[str, Any]] = Field(default_factory=list)
+    columnas_seleccionadas: list[str] = Field(default_factory=list)
+    filas_reporte: list[dict[str, Any]] = Field(default_factory=list)
+    total_registros: int = 0
     activos_mencionados: list[dict[str, Any]] = Field(default_factory=list)
     estadisticas: dict[str, Any] | None = None
     trazas_mcp: list[TrazaHerramientaMcp] = Field(default_factory=list)
     formatos_exportacion: list[Literal["pdf", "excel", "word"]] = Field(default_factory=list)
     incluir_graficas: bool = False
+    advertencias: list[str] = Field(default_factory=list)
     fuera_de_ambito: bool = False
     tokens_usados: int = 0
 

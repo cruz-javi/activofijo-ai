@@ -39,7 +39,7 @@ async def estado_servicio(
     return EstadoServicioIaResponse(
         estado="operativo" if todos_listos else "operativo_sin_modelos",
         modelos_ml=modelos,
-        llm=OpenAICompatibleLlmClient(settings).obtener_estado(),
+        llm=await OpenAICompatibleLlmClient(settings).verificar_estado_en_vivo(),
         mcp=await McpBridgeService().obtener_estado(),
     )
 

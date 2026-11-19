@@ -34,6 +34,7 @@ class ResultadoChatLlm:
     modelo: str
     tokens_usados: int
     tool_calls: tuple[ToolCallLlm, ...] = ()
+    proveedor: str = ""
 
 
 def extraer_json_objeto(texto: str) -> dict[str, Any] | None:
@@ -71,49 +72,175 @@ class OpenAICompatibleLlmClient:
     def obtener_estado(self) -> EstadoProveedorLlm:
         """Devuelve el estado de configuración del proveedor LLM sin exponer credenciales."""
         es_local = self._settings.llm_provider.lower() == "ollama"
+        fb_ok = bool(
+            self._settings.llm_fallback_provider.strip()
+            and self._settings.llm_fallback_api_key.strip()
+        )
         return EstadoProveedorLlm(
             proveedor=self._settings.llm_provider,
             modelo=self._settings.llm_model,
             base_url=self._settings.llm_base_url,
             api_key_configurada=es_local or bool(self._settings.llm_api_key.strip()),
+            conectado=False,
+            modelo_disponible=False,
+            detalle_conexion=None,
+            fallback_disponible=fb_ok,
+            fallback_modelo=self._settings.llm_fallback_model if fb_ok else None,
         )
 
-    async def generar_chat_completado(
-        self,
-        mensajes: list[dict[str, Any]],
-        response_format: dict[str, Any] | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        tool_choice: str | None = None,
-        timeout_override: float | None = None,
-        max_tokens_override: int | None = None,
-        temperature_override: float | None = None,
-    ) -> ResultadoChatLlm:
-        """Envía una solicitud Chat Completions (con soporte tool_calls ReAct) al proveedor LLM."""
-        api_key = self._settings.llm_api_key.strip()
-        es_ollama = self._settings.llm_provider.lower() == "ollama"
-        if not api_key and not es_ollama:
-            raise LlmNoConfiguradoError(
-                "LLM_API_KEY no configurada. Configure Ollama local o una clave compatible."
+    async def verificar_estado_en_vivo(self) -> EstadoProveedorLlm:
+        """Verifica en tiempo real si el proveedor primario (Ollama o Groq) y su respaldo responden."""
+        base_estado = self.obtener_estado()
+        prov = self._settings.llm_provider.lower()
+        es_local = prov == "ollama"
+        if self._settings.env == "test" and self._transport is None:
+            return base_estado.model_copy(
+                update={
+                    "conectado": False,
+                    "modelo_disponible": False,
+                    "detalle_conexion": "Entorno de pruebas (sin ping externo)",
+                }
+            )
+        if not es_local:
+            if not base_estado.api_key_configurada:
+                return base_estado.model_copy(
+                    update={
+                        "conectado": False,
+                        "modelo_disponible": False,
+                        "detalle_conexion": f"Sin API key configurada para {self._settings.llm_provider}",
+                    }
+                )
+            base_remoto = self._settings.llm_base_url.rstrip("/")
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(2.5, connect=1.2),
+                    transport=self._transport,
+                ) as client:
+                    res = await client.get(
+                        f"{base_remoto}/models",
+                        headers={"Authorization": f"Bearer {self._settings.llm_api_key.strip()}"},
+                    )
+                if res.status_code < 400:
+                    return base_estado.model_copy(
+                        update={
+                            "conectado": True,
+                            "modelo_disponible": True,
+                            "detalle_conexion": f"{self._settings.llm_provider.upper()} en línea · Modelo {self._settings.llm_model}",
+                        }
+                    )
+                return base_estado.model_copy(
+                    update={
+                        "conectado": False,
+                        "modelo_disponible": False,
+                        "detalle_conexion": f"{self._settings.llm_provider.upper()} respondió HTTP {res.status_code}",
+                    }
+                )
+            except httpx.HTTPError:
+                return base_estado.model_copy(
+                    update={
+                        "conectado": False,
+                        "modelo_disponible": False,
+                        "detalle_conexion": f"Sin conexión con {self._settings.llm_provider.upper()}",
+                    }
+                )
+
+        base = self._settings.llm_base_url.rstrip("/").removesuffix("/v1")
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(1.8, connect=1.0),
+                transport=self._transport,
+            ) as client:
+                res = await client.get(f"{base}/api/tags")
+            if res.status_code >= 400:
+                return base_estado.model_copy(
+                    update={
+                        "conectado": False,
+                        "modelo_disponible": False,
+                        "detalle_conexion": (
+                            f"Ollama respondió HTTP {res.status_code}"
+                            + (
+                                f" (Respaldo {self._settings.llm_fallback_provider.upper()} listo)"
+                                if base_estado.fallback_disponible
+                                else ""
+                            )
+                        ),
+                    }
+                )
+            data = res.json()
+            modelos = [str(m.get("name") or "") for m in (data.get("models") or []) if isinstance(m, dict)]
+            objetivo = self._settings.llm_model.strip().lower()
+            disponible = any(
+                m.lower() == objetivo or m.lower().startswith(f"{objetivo}:")
+                for m in modelos
+            )
+            return base_estado.model_copy(
+                update={
+                    "conectado": True,
+                    "modelo_disponible": disponible,
+                    "detalle_conexion": (
+                        f"Ollama en línea · Modelo {self._settings.llm_model} listo"
+                        if disponible
+                        else f"Ollama en línea, pero falta modelo '{self._settings.llm_model}'"
+                    )
+                    + (
+                        f" · Respaldo {self._settings.llm_fallback_provider.upper()} activo"
+                        if base_estado.fallback_disponible
+                        else ""
+                    ),
+                }
+            )
+        except httpx.HTTPError:
+            return base_estado.model_copy(
+                update={
+                    "conectado": False,
+                    "modelo_disponible": False,
+                    "detalle_conexion": (
+                        f"Ollama apagado en {base}; respaldo {self._settings.llm_fallback_provider.upper()} disponible"
+                        if base_estado.fallback_disponible
+                        else f"Ollama apagado o inalcanzable en {base}"
+                    ),
+                }
             )
 
-        url = f"{self._settings.llm_base_url.rstrip('/')}/chat/completions"
-        headers: dict[str, str] = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
+    async def _invocar_proveedor(
+        self,
+        *,
+        proveedor: str,
+        base_url: str,
+        api_key: str,
+        modelos: list[str],
+        mensajes: list[dict[str, Any]],
+        response_format: dict[str, Any] | None,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | None,
+        timeout_segundos: float,
+        max_tokens: int,
+        temperature: float,
+    ) -> ResultadoChatLlm:
+        prov_lower = proveedor.lower().strip()
+        es_ollama = prov_lower == "ollama"
+        key_clean = api_key.strip()
+        if not key_clean and not es_ollama:
+            raise LlmNoConfiguradoError(
+                f"LLM_API_KEY no configurada para el proveedor {proveedor}."
+            )
 
-        modelos_a_intentar = [self._settings.llm_model]
-        if es_ollama and self._settings.llm_model != "qwen2.5:3b":
-            modelos_a_intentar.append("qwen2.5:3b")
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if key_clean:
+            headers["Authorization"] = f"Bearer {key_clean}"
 
         ultimo_error: LlmErrorExternoError | None = None
 
-        for modelo in modelos_a_intentar:
+        for modelo in modelos:
             payload: dict[str, Any] = {
                 "model": modelo,
                 "messages": mensajes,
-                "max_tokens": max_tokens_override or self._settings.llm_max_tokens,
-                "temperature": 0.1 if temperature_override is None else temperature_override,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
             }
+            if es_ollama or (prov_lower == "groq" and "qwen" in modelo.lower() and not tools):
+                payload["reasoning_effort"] = "none"
             if response_format is not None and not tools:
                 payload["response_format"] = response_format
             if tools:
@@ -122,7 +249,7 @@ class OpenAICompatibleLlmClient:
 
             try:
                 async with httpx.AsyncClient(
-                    timeout=timeout_override or self._settings.llm_timeout_seconds,
+                    timeout=timeout_segundos,
                     transport=self._transport,
                 ) as client:
                     response = await client.post(url, headers=headers, json=payload)
@@ -135,7 +262,7 @@ class OpenAICompatibleLlmClient:
                     f"Error de red al comunicarse con el proveedor LLM: {exc}", status_code=502
                 ) from exc
 
-            if response.status_code == 404 and es_ollama and modelo != modelos_a_intentar[-1]:
+            if response.status_code == 404 and es_ollama and modelo != modelos[-1]:
                 continue
 
             if response.status_code == 429:
@@ -189,10 +316,69 @@ class OpenAICompatibleLlmClient:
                 modelo=str(data.get("model") or modelo),
                 tokens_usados=tokens,
                 tool_calls=tuple(tool_calls_norm),
+                proveedor=prov_lower,
             )
 
         assert ultimo_error is not None
         raise ultimo_error
+
+    async def generar_chat_completado(
+        self,
+        mensajes: list[dict[str, Any]],
+        response_format: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        timeout_override: float | None = None,
+        max_tokens_override: int | None = None,
+        temperature_override: float | None = None,
+    ) -> ResultadoChatLlm:
+        """Envía una solicitud Chat Completions al proveedor primario y, si falla, al respaldo remoto configurado."""
+        es_ollama = self._settings.llm_provider.lower() == "ollama"
+        modelos_primario = [self._settings.llm_model]
+        if es_ollama and self._settings.llm_model != "qwen2.5:3b":
+            modelos_primario.append("qwen2.5:3b")
+
+        max_tok = max_tokens_override or self._settings.llm_max_tokens
+        temp = 0.1 if temperature_override is None else temperature_override
+        tout = timeout_override or self._settings.llm_timeout_seconds
+
+        try:
+            return await self._invocar_proveedor(
+                proveedor=self._settings.llm_provider,
+                base_url=self._settings.llm_base_url,
+                api_key=self._settings.llm_api_key,
+                modelos=modelos_primario,
+                mensajes=mensajes,
+                response_format=response_format,
+                tools=tools,
+                tool_choice=tool_choice,
+                timeout_segundos=tout,
+                max_tokens=max_tok,
+                temperature=temp,
+            )
+        except LlmErrorExternoError:
+            fb_prov = self._settings.llm_fallback_provider.strip()
+            fb_key = self._settings.llm_fallback_api_key.strip()
+            if (
+                self._transport is None
+                and fb_prov
+                and fb_key
+                and fb_prov.lower() != self._settings.llm_provider.lower()
+            ):
+                return await self._invocar_proveedor(
+                    proveedor=fb_prov,
+                    base_url=self._settings.llm_fallback_base_url,
+                    api_key=fb_key,
+                    modelos=[self._settings.llm_fallback_model],
+                    mensajes=mensajes,
+                    response_format=response_format,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    timeout_segundos=self._settings.llm_fallback_timeout_seconds,
+                    max_tokens=max(max_tok, 420),
+                    temperature=temp,
+                )
+            raise
 
     async def precalentar_ollama(self) -> bool:
         """Precarga el modelo personalizado en RAM de Ollama con keep_alive."""

@@ -20,6 +20,7 @@ RUN useradd --create-home --shell /bin/sh aiuser
 
 COPY --chown=aiuser:aiuser src ./src
 COPY --chown=aiuser:aiuser models ./models
+COPY --chown=aiuser:aiuser training ./training
 
 USER aiuser
 

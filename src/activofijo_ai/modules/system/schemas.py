@@ -23,6 +23,11 @@ class EstadoProveedorLlm(BaseModel):
     modelo: str
     base_url: str
     api_key_configurada: bool
+    conectado: bool = False
+    modelo_disponible: bool = False
+    detalle_conexion: str | None = None
+    fallback_disponible: bool = False
+    fallback_modelo: str | None = None
 
 
 class EstadoMcp(BaseModel):

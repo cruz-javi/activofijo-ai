@@ -39,6 +39,12 @@ from activofijo_ai.modules.llm.mcp_server import (
     normalizar_moneda_texto,
     normalizar_texto,
 )
+from activofijo_ai.modules.llm.planificador_reportes import (
+    FUENTES_REPORTE_VALIDAS,
+    construir_prompt_planificador_reporte,
+    normalizar_y_validar_plan,
+    validar_termino_search_reporte,
+)
 from activofijo_ai.modules.llm.provider import (
     LlmErrorExternoError,
     LlmNoConfiguradoError,
@@ -84,10 +90,29 @@ def _fecha_bolivia_formal() -> str:
     return f"Santa Cruz de la Sierra, {hoy.day:02d} de {MESES_ES[hoy.month - 1]} de {hoy.year}"
 
 
-def _resolver_motor(settings: Settings) -> tuple[str, str]:
+def _resolver_motor(
+    settings: Settings,
+    proveedor_real: str = "",
+    modelo_real: str = "",
+) -> tuple[str, str]:
+    prov = proveedor_real.strip().lower()
+    if prov:
+        return ("ollama_personalizado" if prov == "ollama" else "llm_remoto"), (modelo_real or settings.llm_model)
+    mod_lower = modelo_real.strip().lower()
+    if "/" in mod_lower or "llama-3" in mod_lower or "gpt-oss" in mod_lower:
+        return "llm_remoto", (modelo_real or settings.llm_model)
     if settings.llm_provider.lower() == "ollama":
         return "ollama_personalizado", settings.llm_model
     return "llm_remoto", settings.llm_model
+
+
+def _nombre_proveedor_ui(proveedor_real: str | None, settings: Settings) -> str:
+    prov = (proveedor_real or settings.llm_provider).strip().lower()
+    if prov == "ollama":
+        return "Ollama"
+    if prov == "groq":
+        return "Groq"
+    return prov.upper() or "IA"
 
 
 def _extraer_dict_tool_mcp(resultado: Any) -> dict[str, Any]:
@@ -181,12 +206,21 @@ _ETIQUETAS_HERRAMIENTAS: dict[str, str] = {
     "consultar_trazabilidad_sha256": "Historial y verificación de bien",
     "consultar_proyeccion_random_forest": "Proyección presupuestaria",
     "consultar_reglas_normativas": "Reglamento institucional aplicable",
+    "ejecutar_reporte_dinamico": "Ejecutando consulta parametrizada en PostgreSQL",
 }
 
 
 def _resumir_observacion_tool(nombre_tool: str, obs: dict[str, Any]) -> str:
     if obs.get("ok") is False or obs.get("error"):
         return str(obs.get("error") or "Error consultando fuente")
+    if nombre_tool == "ejecutar_reporte_dinamico":
+        fuente = obs.get("fuente", "PADRON")
+        total = obs.get("totalRegistros", 0)
+        cols = obs.get("columnasSeleccionadas") or []
+        return (
+            f"Fuente {fuente}: {total} registro(s) · {len(cols)} columna(s) "
+            f"({formatear_bs(obs.get('valorTotalBs', 0))})"
+        )
     if nombre_tool == "buscar_activos_padron":
         return (
             f"{obs.get('totalCoincidencias', 0)} activo(s) encontrados "
@@ -615,19 +649,21 @@ class McpBridgeService:
 
         llm = OpenAICompatibleLlmClient(settings, transport=self._transport)
         advertencias: list[str] = []
+        motivo_respaldo: str | None = None
 
         if settings.env != "test" or self._transport is not None:
+            t_red = time.perf_counter()
+            prov_init = _nombre_proveedor_ui(None, settings)
             try:
                 await _emitir(
                     emitir_evento,
                     {
                         "tipo": "paso",
                         "id": "llm-redaccion",
-                        "etiqueta": "Redactando carta formal institucional",
+                        "etiqueta": f"Agente IA ({prov_init} · {settings.llm_model}) redactando carta formal",
                         "estado": "activo",
                     },
                 )
-                t_red = time.perf_counter()
                 mensajes_redaccion: list[dict[str, Any]] = [
                     {
                         "role": "system",
@@ -682,20 +718,32 @@ class McpBridgeService:
                 res = await llm.generar_chat_completado(
                     mensajes=mensajes_redaccion,
                     response_format={"type": "json_object"},
-                    max_tokens_override=650 if payload.borrador_actual is not None else 360,
+                    max_tokens_override=520 if payload.borrador_actual is not None else 280,
                     temperature_override=0.2,
+                )
+                prov_res = _nombre_proveedor_ui(res.proveedor, settings)
+                uso_respaldo_remoto = bool(
+                    res.proveedor and res.proveedor.lower() != settings.llm_provider.lower()
                 )
                 await _emitir(
                     emitir_evento,
                     {
                         "tipo": "paso",
                         "id": "llm-redaccion",
-                        "etiqueta": "Redactando carta formal institucional",
-                        "detalle": "Análisis semántico y redacción completados",
+                        "etiqueta": f"Agente IA ({prov_res} · {res.modelo}) redactando carta formal",
+                        "detalle": (
+                            f"Rescatado vía {prov_res} ({res.modelo}, {res.tokens_usados} tokens)"
+                            if uso_respaldo_remoto
+                            else f"Redacción completada con {prov_res} ({res.modelo}, {res.tokens_usados} tokens)"
+                        ),
                         "duracionMs": int((time.perf_counter() - t_red) * 1000),
                         "estado": "completado",
                     },
                 )
+                if uso_respaldo_remoto:
+                    advertencias.append(
+                        f"Motor primario ({settings.llm_provider}) no respondió a tiempo; redactado automáticamente con {prov_res} ({res.modelo})."
+                    )
                 datos = extraer_json_objeto(res.contenido)
                 if datos and payload.borrador_actual is None and not isinstance(datos.get("cuerpo_parrafos"), list):
                     referencia_comp, parrafos_comp, _unidad_comp = self._componer_carta_desde_semantica(
@@ -724,10 +772,12 @@ class McpBridgeService:
                         trazas_mcp.append(val_traza)
                         parrafos_out = [str(p) for p in validado.get("cuerpo_parrafos", []) if str(p).strip()]
                         advertencias.extend(str(a) for a in validado.get("advertencias", []))
-                        motor_id, _ = _resolver_motor(settings)
+                        motor_id, _ = _resolver_motor(settings, res.proveedor)
                         return RedaccionAsistidaResponse(
                             motor_utilizado=motor_id,  # type: ignore[arg-type]
                             modelo=res.modelo,
+                            ia_activa=True,
+                            motivo_respaldo=None,
                             tipo_documento_detectado=tipo_doc,  # type: ignore[arg-type]
                             referencia=normalizar_moneda_texto(referencia_comp),
                             lugar_fecha=lugar_fecha,
@@ -760,7 +810,10 @@ class McpBridgeService:
                         unidad_inferida=unidad_inferida,
                     )
                     if motivo_rechazo is not None:
-                        advertencias.append(motivo_rechazo)
+                        motivo_respaldo = (
+                            f"Borrador del modelo ({res.modelo}) descartado por control de calidad: {motivo_rechazo}"
+                        )
+                        advertencias.append(motivo_respaldo)
                     else:
                         validado, val_traza = await self._llamar_tool_con_traza(
                             "validar_integridad_texto",
@@ -811,10 +864,12 @@ class McpBridgeService:
                                 if payload.borrador_actual and not edicion_parcial.get("toca_destinatario")
                                 else (str(datos.get("destinatario_cargo") or "").strip() or destinatario_cargo)
                             )
-                            motor_id, _ = _resolver_motor(settings)
+                            motor_id, _ = _resolver_motor(settings, res.proveedor)
                             return RedaccionAsistidaResponse(
                                 motor_utilizado=motor_id,  # type: ignore[arg-type]
                                 modelo=res.modelo,
+                                ia_activa=True,
+                                motivo_respaldo=None,
                                 tipo_documento_detectado=tipo_doc,  # type: ignore[arg-type]
                                 referencia=referencia,
                                 lugar_fecha=lugar_fecha,
@@ -829,9 +884,26 @@ class McpBridgeService:
                                 exportacion_solicitada=exportacion_solicitada,  # type: ignore[arg-type]
                                 tokens_usados=res.tokens_usados,
                             )
-            except (LlmNoConfiguradoError, LlmErrorExternoError):
-                advertencias.append(
-                    "Modelo Ollama local no disponible en este instante; se aplicó redacción formal institucional."
+                if not motivo_respaldo:
+                    motivo_respaldo = (
+                        f"El modelo ({res.modelo}) devolvió un formato incompleto; se aplicó plantilla normativa de respaldo."
+                    )
+                    advertencias.append(motivo_respaldo)
+            except (LlmNoConfiguradoError, LlmErrorExternoError) as exc:
+                motivo_respaldo = (
+                    f"Ollama apagado o sin respuesta ({exc}). Se aplicó plantilla normativa estática sin intervención de IA."
+                )
+                advertencias.append(motivo_respaldo)
+                await _emitir(
+                    emitir_evento,
+                    {
+                        "tipo": "paso",
+                        "id": "llm-redaccion",
+                        "etiqueta": "Ollama no disponible — Respaldo estático activo",
+                        "detalle": motivo_respaldo,
+                        "duracionMs": int((time.perf_counter() - t_red) * 1000),
+                        "estado": "advertencia",
+                    },
                 )
 
         parrafos_det = self._redactar_determinista(
@@ -853,7 +925,10 @@ class McpBridgeService:
         )
         return RedaccionAsistidaResponse(
             motor_utilizado="respaldo_determinista",
-            modelo=f"{settings.llm_model} (redaccion-normativa)",
+            modelo=f"{settings.llm_model} (respaldo-estatico)",
+            ia_activa=False,
+            motivo_respaldo=motivo_respaldo
+            or "Plantilla normativa estática aplicada sin intervención del modelo Ollama.",
             tipo_documento_detectado=tipo_doc,  # type: ignore[arg-type]
             referencia=(
                 payload.borrador_actual.referencia
@@ -1556,7 +1631,7 @@ class McpBridgeService:
                             normalizar_moneda_texto(str(parsed.get("explicacion") or ""))
                             or self._explicar_filtros(filtros_det)
                         )
-                        motor_id, _ = _resolver_motor(settings)
+                        motor_id, _ = _resolver_motor(settings, res.proveedor)
                         return ConsultaLenguajeNaturalResponse(
                             motor_utilizado=motor_id,  # type: ignore[arg-type]
                             modelo=res.modelo,
@@ -1612,15 +1687,44 @@ class McpBridgeService:
     ) -> FiltrosDetectadosReporte:
         raw_estado = str(raw.get("estado") or "").strip().upper()
         raw_cond = str(raw.get("condicion") or "").strip().upper()
+        raw_fuente = str(raw.get("fuente") or "").strip().upper()
+        estados_extra = {
+            "VIGENTE",
+            "TRANSFERIDO",
+            "HISTORICO",
+            "ENCONTRADO",
+            "CON_DIFERENCIA",
+            "FALTANTE",
+            "SOBRANTE",
+            "PENDIENTE",
+            "CONCILIADO",
+        }
+        estado_ok = raw_estado in ESTADOS_PADRON_VALIDOS or raw_estado in estados_extra
+        cols_raw = raw.get("columnas")
+        cols_val = (
+            [str(c).strip() for c in cols_raw if str(c).strip()]
+            if isinstance(cols_raw, list) and cols_raw
+            else base.columnas
+        )
         return FiltrosDetectadosReporte(
+            fuente=raw_fuente if raw_fuente in FUENTES_REPORTE_VALIDAS else base.fuente,
             search=str(raw["search"]).strip() if raw.get("search") else base.search,
-            estado=raw_estado if raw_estado in ESTADOS_PADRON_VALIDOS else base.estado,
+            estado=raw_estado if estado_ok else base.estado,
             condicion=raw_cond if raw_cond in CONDICIONES_PADRON_VALIDAS else base.condicion,
             grupo_contable=str(raw["grupo_contable"]).strip() if raw.get("grupo_contable") else base.grupo_contable,
             ubicacion=str(raw["ubicacion"]).strip() if raw.get("ubicacion") else base.ubicacion,
+            marca=str(raw["marca"]).strip() if raw.get("marca") else base.marca,
+            modelo=str(raw["modelo"]).strip() if raw.get("modelo") else base.modelo,
+            custodio=str(raw["custodio"]).strip() if raw.get("custodio") else base.custodio,
             valor_min=float(raw["valor_min"]) if isinstance(raw.get("valor_min"), (int, float)) else base.valor_min,
             valor_max=float(raw["valor_max"]) if isinstance(raw.get("valor_max"), (int, float)) else base.valor_max,
             gestion=int(raw["gestion"]) if isinstance(raw.get("gestion"), int) else base.gestion,
+            fecha_desde=str(raw["fecha_desde"]).strip() if raw.get("fecha_desde") else base.fecha_desde,
+            fecha_hasta=str(raw["fecha_hasta"]).strip() if raw.get("fecha_hasta") else base.fecha_hasta,
+            ordenar_por=str(raw["ordenar_por"]).strip() if raw.get("ordenar_por") else base.ordenar_por,
+            orden_dir=str(raw["orden_dir"]).strip().upper() if raw.get("orden_dir") else base.orden_dir,
+            limite=int(raw["limite"]) if isinstance(raw.get("limite"), int) else base.limite,
+            columnas=cols_val,
         )
 
     def _heredar_filtros_sesion(
@@ -1628,21 +1732,42 @@ class McpBridgeService:
         actual: FiltrosDetectadosReporte,
         previos_raw: dict[str, Any],
     ) -> FiltrosDetectadosReporte:
+        prev_search = validar_termino_search_reporte(
+            str(previos_raw.get("search") or "") or None,
+            consulta_corregida=str(previos_raw.get("search") or ""),
+            ubicacion=str(actual.ubicacion or previos_raw.get("ubicacion") or "") or None,
+            marca=str(actual.marca or previos_raw.get("marca") or "") or None,
+        )
         prev_norm = {
-            "search": previos_raw.get("search"),
+            "fuente": previos_raw.get("fuente"),
+            "search": prev_search,
             "estado": previos_raw.get("estado"),
             "condicion": previos_raw.get("condicion"),
             "grupo_contable": previos_raw.get("grupo_contable") or previos_raw.get("grupoContable"),
             "ubicacion": previos_raw.get("ubicacion"),
+            "marca": previos_raw.get("marca"),
+            "modelo": previos_raw.get("modelo"),
+            "custodio": previos_raw.get("custodio"),
             "valor_min": previos_raw.get("valor_min") if previos_raw.get("valor_min") is not None else previos_raw.get("valorMin"),
             "valor_max": previos_raw.get("valor_max") if previos_raw.get("valor_max") is not None else previos_raw.get("valorMax"),
-            "gestion": previos_raw.get("gestion"),
+            "gestion": None if (actual.fecha_desde or actual.fecha_hasta) else previos_raw.get("gestion"),
+            "fecha_desde": None if actual.gestion is not None else (previos_raw.get("fecha_desde") or previos_raw.get("fechaDesde")),
+            "fecha_hasta": None if actual.gestion is not None else (previos_raw.get("fecha_hasta") or previos_raw.get("fechaHasta")),
+            "ordenar_por": previos_raw.get("ordenar_por") or previos_raw.get("ordenarPor"),
+            "orden_dir": previos_raw.get("orden_dir") or previos_raw.get("ordenDir"),
+            "limite": previos_raw.get("limite"),
+            "columnas": previos_raw.get("columnas"),
         }
         base_prev = self._combinar_filtros(FiltrosDetectadosReporte(), prev_norm)
-        return self._combinar_filtros(base_prev, actual.model_dump(exclude_none=True))
+        combinado = self._combinar_filtros(base_prev, actual.model_dump(exclude_none=True))
+        if combinado.fecha_desde or combinado.fecha_hasta:
+            combinado.gestion = None
+        return combinado
 
     def _explicar_filtros(self, f: FiltrosDetectadosReporte) -> str:
         partes: list[str] = []
+        if f.fuente and f.fuente != "PADRON":
+            partes.append(f"fuente {f.fuente}")
         if f.search:
             partes.append(f"código/texto '{f.search}'")
         if f.grupo_contable:
@@ -1653,16 +1778,28 @@ class McpBridgeService:
             partes.append(f"condición física {f.condicion}")
         if f.ubicacion:
             partes.append(f"unidad '{f.ubicacion}'")
+        if f.marca:
+            partes.append(f"marca '{f.marca}'")
+        if f.custodio:
+            partes.append(f"custodio '{f.custodio}'")
         if f.valor_min is not None:
             partes.append(f"valor >= Bs. {f.valor_min:,.2f}")
         if f.valor_max is not None:
             partes.append(f"valor <= Bs. {f.valor_max:,.2f}")
-        if f.gestion is not None:
+        if f.fecha_desde and f.fecha_hasta:
+            partes.append(f"período {f.fecha_desde} a {f.fecha_hasta}")
+        elif f.fecha_desde:
+            partes.append(f"desde {f.fecha_desde}")
+        elif f.fecha_hasta:
+            partes.append(f"hasta {f.fecha_hasta}")
+        elif f.gestion is not None:
             partes.append(f"gestión {f.gestion}")
+        if f.columnas:
+            partes.append(f"{len(f.columnas)} columnas solicitadas")
 
         if not partes:
-            return "Se analizará el lote actual completo sin restricciones adicionales."
-        return "Filtros MCP interpretados: " + ", ".join(partes) + "."
+            return "Se analizará el lote institucional completo sin restricciones adicionales."
+        return "Criterios aplicados: " + ", ".join(partes) + "."
 
     async def responder_ayuda_sistema(
         self,
@@ -1845,7 +1982,7 @@ class McpBridgeService:
                             for p in (parsed.get("pasos") or [])
                             if str(p).strip()
                         ][:4]
-                        motor_id, _ = _resolver_motor(settings)
+                        motor_id, _ = _resolver_motor(settings, "", modelo_llm)
                         return AyudaSistemaResponse(
                             motor_utilizado=motor_id,  # type: ignore[arg-type]
                             modelo=modelo_llm,
@@ -1858,7 +1995,7 @@ class McpBridgeService:
                             tokens_usados=tokens_llm,
                         )
                     if contenido_llm.strip():
-                        motor_id, _ = _resolver_motor(settings)
+                        motor_id, _ = _resolver_motor(settings, "", modelo_llm)
                         return AyudaSistemaResponse(
                             motor_utilizado=motor_id,  # type: ignore[arg-type]
                             modelo=modelo_llm,
@@ -1900,6 +2037,8 @@ class McpBridgeService:
             return ConsultaAnaliticaResponse(
                 motor_utilizado="respaldo_determinista",
                 modelo=settings.llm_model,
+                ia_activa=False,
+                motivo_respaldo="Consulta bloqueada por política institucional fuera de ámbito patrimonial.",
                 respuesta="Consulta fuera del ámbito patrimonial del Departamento de Activos Fijos UAGRM.",
                 filtros_detectados=FiltrosDetectadosReporte(),
                 activos_mencionados=[],
@@ -1917,6 +2056,7 @@ class McpBridgeService:
         tok_cli, tok_seg = self._preparar_contexto_seguridad(settings, payload.contexto_seguridad)
         try:
             trazas_mcp: list[TrazaHerramientaMcp] = []
+            advertencias: list[str] = []
             filtros_dict, traza_f = await self._llamar_tool_con_traza(
                 "filtrar_catalogo_reportes",
                 {"consulta_usuario": consulta_corregida},
@@ -1924,9 +2064,25 @@ class McpBridgeService:
             )
             trazas_mcp.append(traza_f)
             filtros_det = FiltrosDetectadosReporte(**filtros_dict)
-            if (
+
+            es_consulta_completa_nueva = (
+                any(
+                    pal in q_norm
+                    for pal in (
+                        "todos los activos",
+                        "todos los bienes",
+                        "necesito un reporte",
+                        "dame un reporte",
+                        "genera un reporte",
+                        "quiero un reporte",
+                    )
+                )
+                and bool(filtros_det.ubicacion or filtros_det.estado or filtros_det.grupo_contable)
+            )
+            es_refinamiento = bool(
                 payload.reporte_previo
                 and isinstance(payload.reporte_previo.filtros_detectados, dict)
+                and not es_consulta_completa_nueva
                 and not any(
                     pal in q_norm
                     for pal in (
@@ -1940,19 +2096,28 @@ class McpBridgeService:
                         "reiniciar",
                     )
                 )
-            ):
+            )
+            if es_refinamiento and payload.reporte_previo and payload.reporte_previo.filtros_detectados:
                 filtros_det = self._heredar_filtros_sesion(
                     filtros_det,
                     payload.reporte_previo.filtros_detectados,
                 )
 
             activos_mencionados: list[dict[str, Any]] = []
+            filas_reporte: list[dict[str, Any]] = []
+            columnas_disponibles: list[dict[str, Any]] = []
+            columnas_seleccionadas: list[str] = []
+            fuente_reporte = "PADRON"
+            titulo_sugerido: str | None = None
             total_coincidencias_db = 0
             estadisticas: dict[str, Any] | None = None
             respuesta_llm = ""
-            modelo_usado = f"{settings.llm_model} (mcp-directo)"
+            modelo_usado = f"{settings.llm_model} (respaldo-estatico)"
             tokens_usados = 0
             motor_usado: str = "respaldo_determinista"
+            ia_activa = False
+            motivo_respaldo: str | None = None
+            plan_llm: dict[str, Any] | None = None
 
             llm = OpenAICompatibleLlmClient(settings, transport=self._transport)
             tools_analitica = {
@@ -1962,6 +2127,7 @@ class McpBridgeService:
                 "consultar_trazabilidad_sha256",
                 "consultar_proyeccion_random_forest",
                 "consultar_reglas_normativas",
+                "ejecutar_reporte_dinamico",
             }
 
             args_stats_det = self._args_padron_desde_filtros(filtros_det)
@@ -1986,110 +2152,367 @@ class McpBridgeService:
                     "vida util",
                 )
             )
-            usar_react = self._transport is not None or es_consulta_especializada
 
-            if (settings.env != "test" or self._transport is not None) and usar_react:
-                try:
-                    criterios_obligatorios = {
-                        k: v for k, v in args_stats_det.items() if v is not None
-                    }
-                    mensajes: list[dict[str, Any]] = [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Agente Analítico Patrimonial UAGRM. Consulta fuentes vía herramientas "
-                                "aplicando ESTRICTAMENTE los criterios solicitados "
-                                f"({json.dumps(criterios_obligatorios, ensure_ascii=False)}). "
-                                "Usa los estados reales (BUENO, REGULAR, MALO, EN_REPARACION, BAJA) y "
-                                "condiciones (NUEVO, USADO, DETERIORADO). Sintetiza únicamente información "
-                                "de los bienes coincidentes en español boliviano y moneda Bs.; si hay 0 coincidencias, indícalo claramente."
-                            ),
-                        },
-                    ]
-                    for turno in payload.historial[-6:]:
-                        mensajes.append(
+            # Invocación REAL de Ollama en todas las consultas analíticas (nunca saltarse el LLM en vivo)
+            usar_react_puro = es_consulta_especializada or (
+                self._transport is not None and payload.modulo != "reportes"
+            )
+            if settings.env != "test" or self._transport is not None:
+                if usar_react_puro:
+                    t_react = time.perf_counter()
+                    try:
+                        criterios_obligatorios = {
+                            k: v for k, v in args_stats_det.items() if v is not None
+                        }
+                        mensajes: list[dict[str, Any]] = [
                             {
-                                "role": "user" if turno.rol == "usuario" else "assistant",
-                                "content": turno.texto,
-                            }
-                        )
-                    if payload.reporte_previo and payload.reporte_previo.resumen_ejecutivo:
-                        mensajes.append(
-                            {
-                                "role": "user",
+                                "role": "system",
                                 "content": (
-                                    "Contexto del reporte actual en sesión temporal (filtros previos: "
-                                    f"{json.dumps(payload.reporte_previo.filtros_detectados or {}, ensure_ascii=False)}): "
-                                    f"{payload.reporte_previo.resumen_ejecutivo[:500]}"
+                                    "Agente Analítico Patrimonial UAGRM. Consulta fuentes vía herramientas "
+                                    "aplicando ESTRICTAMENTE los criterios solicitados "
+                                    f"({json.dumps(criterios_obligatorios, ensure_ascii=False)}). "
+                                    "Usa los estados reales (BUENO, REGULAR, MALO, EN_REPARACION, BAJA) y "
+                                    "condiciones (NUEVO, USADO, DETERIORADO). Sintetiza únicamente información "
+                                    "de los bienes coincidentes en español boliviano y moneda Bs.; si hay 0 coincidencias, indícalo claramente."
                                 ),
-                            }
+                            },
+                        ]
+                        for turno in payload.historial[-6:]:
+                            mensajes.append(
+                                {
+                                    "role": "user" if turno.rol == "usuario" else "assistant",
+                                    "content": turno.texto,
+                                }
+                            )
+                        if payload.reporte_previo and payload.reporte_previo.resumen_ejecutivo:
+                            mensajes.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Contexto del reporte actual en sesión temporal (filtros previos: "
+                                        f"{json.dumps(payload.reporte_previo.filtros_detectados or {}, ensure_ascii=False)}): "
+                                        f"{payload.reporte_previo.resumen_ejecutivo[:500]}"
+                                    ),
+                                }
+                            )
+                        mensajes.append({"role": "user", "content": payload.consulta})
+                        contenido, modelo_usado, tokens_usados, trazas_react, obs = (
+                            await self._ejecutar_bucle_react(
+                                llm=llm,
+                                mensajes_iniciales=mensajes,
+                                nombres_tools=tools_analitica,
+                                max_iteraciones=2,
+                                emitir_evento=emitir_evento,
+                                tool_args_override=enforced_tool_args,
+                            )
                         )
-                    mensajes.append({"role": "user", "content": payload.consulta})
-                    contenido, modelo_usado, tokens_usados, trazas_react, obs = (
-                        await self._ejecutar_bucle_react(
-                            llm=llm,
-                            mensajes_iniciales=mensajes,
-                            nombres_tools=tools_analitica,
-                            max_iteraciones=2,
-                            emitir_evento=emitir_evento,
-                            tool_args_override=enforced_tool_args,
+                        trazas_mcp.extend(trazas_react)
+                        ia_activa = True
+                        motor_usado, _ = _resolver_motor(settings, "", modelo_usado)
+                        if "buscar_activos_padron" in obs and obs["buscar_activos_padron"].get("ok") is not False:
+                            activos_mencionados = list(obs["buscar_activos_padron"].get("activos") or [])
+                            total_coincidencias_db = int(
+                                obs["buscar_activos_padron"].get("totalCoincidencias") or len(activos_mencionados)
+                            )
+                        if "obtener_estadisticas_padron" in obs and obs["obtener_estadisticas_padron"].get("ok") is not False:
+                            estadisticas = obs["obtener_estadisticas_padron"]
+                        if contenido.strip():
+                            respuesta_llm = normalizar_moneda_texto(contenido.strip())
+                    except (LlmNoConfiguradoError, LlmErrorExternoError) as exc:
+                        obs = {}
+                        ia_activa = False
+                        motivo_respaldo = (
+                            f"Ollama apagado o sin respuesta ({exc}). Se aplicó consulta determinista sin LLM."
                         )
+                        advertencias.append(motivo_respaldo)
+                        await _emitir(
+                            emitir_evento,
+                            {
+                                "tipo": "paso",
+                                "id": "llm-planificador",
+                                "etiqueta": "Ollama no disponible — Respaldo determinista activo",
+                                "detalle": motivo_respaldo,
+                                "duracionMs": int((time.perf_counter() - t_react) * 1000),
+                                "estado": "advertencia",
+                            },
+                        )
+                else:
+                    t_plan = time.perf_counter()
+                    prov_init_rep = _nombre_proveedor_ui(None, settings)
+                    await _emitir(
+                        emitir_evento,
+                        {
+                            "tipo": "paso",
+                            "id": "llm-planificador",
+                            "etiqueta": f"Agente IA ({prov_init_rep} · {settings.llm_model}) planificando criterios y columnas",
+                            "estado": "activo",
+                        },
                     )
-                    trazas_mcp.extend(trazas_react)
-                    if "buscar_activos_padron" in obs and obs["buscar_activos_padron"].get("ok") is not False:
-                        activos_mencionados = list(obs["buscar_activos_padron"].get("activos") or [])
+                    try:
+                        filtros_previos_ctx = (
+                            payload.reporte_previo.filtros_detectados
+                            if es_refinamiento and payload.reporte_previo
+                            else None
+                        )
+                        mensajes_plan = construir_prompt_planificador_reporte(
+                            consulta_corregida,
+                            filtros_previos=filtros_previos_ctx,
+                        )
+                        res_plan = await llm.generar_chat_completado(
+                            mensajes=mensajes_plan,
+                            response_format={"type": "json_object"},
+                            max_tokens_override=180,
+                            temperature_override=0.05,
+                        )
+                        dur_plan_ms = int((time.perf_counter() - t_plan) * 1000)
+                        tokens_usados += res_plan.tokens_usados
+                        modelo_usado = res_plan.modelo
+                        ia_activa = True
+                        motor_usado, _ = _resolver_motor(settings, res_plan.proveedor, res_plan.modelo)
+                        prov_plan_ui = _nombre_proveedor_ui(res_plan.proveedor, settings)
+                        uso_fb_plan = bool(
+                            res_plan.proveedor and res_plan.proveedor.lower() != settings.llm_provider.lower()
+                        )
+                        if uso_fb_plan:
+                            advertencias.append(
+                                f"Motor primario ({settings.llm_provider}) no disponible; planificado automáticamente con {prov_plan_ui} ({res_plan.modelo})."
+                            )
+
+                        if res_plan.tool_calls:
+                            # Compatibilidad completa con respuestas ReAct tool-calling
+                            await _emitir(
+                                emitir_evento,
+                                {
+                                    "tipo": "paso",
+                                    "id": "llm-planificador",
+                                    "etiqueta": f"Agente IA ({prov_plan_ui} · {res_plan.modelo}) planificando criterios y columnas",
+                                    "detalle": f"{len(res_plan.tool_calls)} herramienta(s) invocadas ({res_plan.tokens_usados} tokens)",
+                                    "duracionMs": dur_plan_ms,
+                                    "estado": "completado",
+                                },
+                            )
+                            mensajes_react_cont: list[dict[str, Any]] = list(mensajes_plan)
+                            mensajes_react_cont.append(
+                                {
+                                    "role": "assistant",
+                                    "content": res_plan.contenido or "",
+                                    "tool_calls": [
+                                        {
+                                            "id": tc.id,
+                                            "type": "function",
+                                            "function": {
+                                                "name": tc.name,
+                                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                                            },
+                                        }
+                                        for tc in res_plan.tool_calls
+                                    ],
+                                }
+                            )
+                            for tc in res_plan.tool_calls[:4]:
+                                args_tc = dict(tc.arguments or {})
+                                if tc.name in enforced_tool_args:
+                                    for k_ov, v_ov in enforced_tool_args[tc.name].items():
+                                        if v_ov is not None:
+                                            args_tc[k_ov] = v_ov
+                                obs_tc, traza_tc = await self._llamar_tool_con_traza(
+                                    tc.name,
+                                    args_tc,
+                                    emitir_evento=emitir_evento,
+                                )
+                                trazas_mcp.append(traza_tc)
+                                obs[tc.name] = obs_tc
+                                mensajes_react_cont.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "name": tc.name,
+                                        "content": _compactar_observacion_para_llm(obs_tc),
+                                    }
+                                )
+                            if "buscar_activos_padron" in obs and obs["buscar_activos_padron"].get("ok") is not False:
+                                activos_mencionados = list(obs["buscar_activos_padron"].get("activos") or [])
+                                total_coincidencias_db = int(
+                                    obs["buscar_activos_padron"].get("totalCoincidencias") or len(activos_mencionados)
+                                )
+                            if "obtener_estadisticas_padron" in obs and obs["obtener_estadisticas_padron"].get("ok") is not False:
+                                estadisticas = obs["obtener_estadisticas_padron"]
+                            res_final = await llm.generar_chat_completado(mensajes=mensajes_react_cont)
+                            tokens_usados += res_final.tokens_usados
+                            if res_final.contenido.strip():
+                                respuesta_llm = normalizar_moneda_texto(res_final.contenido.strip())
+                        else:
+                            plan_llm = extraer_json_objeto(res_plan.contenido)
+                            if not plan_llm and res_plan.contenido.strip():
+                                respuesta_llm = normalizar_moneda_texto(res_plan.contenido.strip())
+                            await _emitir(
+                                emitir_evento,
+                                {
+                                    "tipo": "paso",
+                                    "id": "llm-planificador",
+                                    "etiqueta": f"Agente IA ({prov_plan_ui} · {res_plan.modelo}) planificando criterios y columnas",
+                                    "detalle": (
+                                        f"Rescatado vía {prov_plan_ui} ({res_plan.modelo}, {res_plan.tokens_usados} tokens)"
+                                        if uso_fb_plan
+                                        else f"Plan estructurado validado ({res_plan.modelo}, {res_plan.tokens_usados} tokens)"
+                                    ),
+                                    "duracionMs": dur_plan_ms,
+                                    "estado": "completado",
+                                },
+                            )
+                    except (LlmNoConfiguradoError, LlmErrorExternoError) as exc:
+                        ia_activa = False
+                        motivo_respaldo = (
+                            f"Motor IA ({prov_init_rep}) apagado o sin respuesta ({exc}). Se aplicó planificación determinista sin LLM."
+                        )
+                        advertencias.append(motivo_respaldo)
+                        await _emitir(
+                            emitir_evento,
+                            {
+                                "tipo": "paso",
+                                "id": "llm-planificador",
+                                "etiqueta": f"{prov_init_rep} no disponible — Respaldo determinista activo",
+                                "detalle": motivo_respaldo,
+                                "duracionMs": int((time.perf_counter() - t_plan) * 1000),
+                                "estado": "advertencia",
+                            },
+                        )
+
+            # Fusionar y blindar plan final (fuente, filtros, fechas, orden, límite, columnas dinámicas)
+            if es_refinamiento and payload.reporte_previo and payload.reporte_previo.filtros_detectados:
+                fuente_prev_ref = str(payload.reporte_previo.filtros_detectados.get("fuente") or "PADRON").upper()
+                if fuente_prev_ref in FUENTES_REPORTE_VALIDAS and fuente_prev_ref != "PADRON":
+                    if not isinstance(plan_llm, dict):
+                        plan_llm = {"fuente": fuente_prev_ref}
+                    elif not plan_llm.get("fuente") or str(plan_llm.get("fuente")).upper() == "PADRON":
+                        plan_llm = {**plan_llm, "fuente": fuente_prev_ref}
+
+            plan = normalizar_y_validar_plan(
+                plan_llm=plan_llm,
+                filtros_det=filtros_det.model_dump(),
+                consulta_corregida=consulta_corregida,
+            )
+            fuente_reporte = str(plan["fuente"] or "PADRON")
+            titulo_sugerido = plan.get("titulo_reporte")
+            filtros_det = FiltrosDetectadosReporte(
+                fuente=fuente_reporte,
+                search=plan.get("search"),
+                estado=plan.get("estado"),
+                condicion=plan.get("condicion"),
+                grupo_contable=plan.get("grupo_contable"),
+                ubicacion=plan.get("ubicacion"),
+                marca=plan.get("marca"),
+                custodio=plan.get("custodio"),
+                valor_min=plan.get("valor_min"),
+                valor_max=plan.get("valor_max"),
+                gestion=plan.get("gestion"),
+                fecha_desde=plan.get("fecha_desde"),
+                fecha_hasta=plan.get("fecha_hasta"),
+                ordenar_por=plan.get("ordenar_por"),
+                orden_dir=plan.get("orden_dir"),
+                limite=plan.get("limite"),
+                columnas=plan.get("columnas"),
+            )
+            if es_refinamiento and payload.reporte_previo and payload.reporte_previo.filtros_detectados:
+                # Si el usuario no cambió de fuente, conservar criterios previos que no fueron sobrescritos
+                fuente_prev = str(payload.reporte_previo.filtros_detectados.get("fuente") or "PADRON").upper()
+                if fuente_reporte == "PADRON" and fuente_prev != "PADRON":
+                    fuente_reporte = fuente_prev
+                    filtros_det.fuente = fuente_prev
+                filtros_det = self._heredar_filtros_sesion(
+                    filtros_det,
+                    payload.reporte_previo.filtros_detectados,
+                )
+
+            # Ejecutar consulta SQL dinámica parametrizada (7 fuentes + columnas dinámicas + RBAC)
+            limite_consulta = int(filtros_det.limite or 50)
+            din_obs, traza_din = await self._llamar_tool_con_traza(
+                "ejecutar_reporte_dinamico",
+                {
+                    "fuente": filtros_det.fuente or "PADRON",
+                    "unidad": filtros_det.ubicacion,
+                    "estado": filtros_det.estado,
+                    "condicion": filtros_det.condicion,
+                    "grupo_contable": filtros_det.grupo_contable,
+                    "marca": filtros_det.marca,
+                    "modelo": filtros_det.modelo,
+                    "custodio": filtros_det.custodio,
+                    "search": filtros_det.search,
+                    "valor_min": filtros_det.valor_min,
+                    "valor_max": filtros_det.valor_max,
+                    "gestion": filtros_det.gestion,
+                    "fecha_desde": filtros_det.fecha_desde,
+                    "fecha_hasta": filtros_det.fecha_hasta,
+                    "ordenar_por": filtros_det.ordenar_por,
+                    "orden_dir": filtros_det.orden_dir,
+                    "limit": min(max(limite_consulta, 1), 200),
+                    "columnas": filtros_det.columnas,
+                },
+                emitir_evento=emitir_evento,
+            )
+            if din_obs.get("ok") is not False and isinstance(din_obs.get("filas"), list):
+                trazas_mcp.append(traza_din)
+                fuente_reporte = str(din_obs.get("fuente") or filtros_det.fuente or "PADRON")
+                filtros_det.fuente = fuente_reporte
+                filas_reporte = list(din_obs.get("filas") or [])
+                columnas_disponibles = list(din_obs.get("columnasDisponibles") or [])
+                columnas_seleccionadas = [
+                    str(c) for c in (din_obs.get("columnasSeleccionadas") or []) if str(c).strip()
+                ]
+                total_coincidencias_db = int(din_obs.get("totalRegistros") or len(filas_reporte))
+                if din_obs.get("estadisticas"):
+                    estadisticas = din_obs["estadisticas"]
+                if not activos_mencionados:
+                    activos_mencionados = filas_reporte[:12]
+            else:
+                # Respaldo retrocompatible (ej. mocks de test que solo implementan buscar-activos / estadisticas-padron)
+                args_stats_fb = self._args_padron_desde_filtros(filtros_det)
+                args_busq_fb = self._args_padron_desde_filtros(filtros_det, limit=12)
+                busco_db = "buscar_activos_padron" in obs and obs["buscar_activos_padron"].get("ok") is not False
+                if not busco_db:
+                    busq_obs, traza_b = await self._llamar_tool_con_traza(
+                        "buscar_activos_padron",
+                        args_busq_fb,
+                        emitir_evento=emitir_evento,
+                    )
+                    trazas_mcp.append(traza_b)
+                    if busq_obs.get("ok") is not False:
+                        activos_mencionados = list(busq_obs.get("activos") or [])
                         total_coincidencias_db = int(
-                            obs["buscar_activos_padron"].get("totalCoincidencias") or len(activos_mencionados)
+                            busq_obs.get("totalCoincidencias") or len(activos_mencionados)
                         )
-                    if "obtener_estadisticas_padron" in obs and obs["obtener_estadisticas_padron"].get("ok") is not False:
-                        estadisticas = obs["obtener_estadisticas_padron"]
-                    if contenido.strip():
-                        respuesta_llm = normalizar_moneda_texto(contenido.strip())
-                        motor_usado, _ = _resolver_motor(settings)
-                except (LlmNoConfiguradoError, LlmErrorExternoError):
-                    obs = {}
-
-            # Garantiza anclaje real filtrado incluso si el LLM omitió consultar o en vía rápida directa
-            busco_db = "buscar_activos_padron" in obs and obs["buscar_activos_padron"].get("ok") is not False
-            if not busco_db:
-                busq_obs, traza_b = await self._llamar_tool_con_traza(
-                    "buscar_activos_padron",
-                    args_busqueda_det,
-                    emitir_evento=emitir_evento,
-                )
-                trazas_mcp.append(traza_b)
-                if busq_obs.get("ok") is not False:
-                    activos_mencionados = list(busq_obs.get("activos") or [])
-                    total_coincidencias_db = int(
-                        busq_obs.get("totalCoincidencias") or len(activos_mencionados)
+                if estadisticas is None:
+                    stats_obs, traza_s = await self._llamar_tool_con_traza(
+                        "obtener_estadisticas_padron",
+                        args_stats_fb,
+                        emitir_evento=emitir_evento,
                     )
-
-            if estadisticas is None:
-                stats_obs, traza_s = await self._llamar_tool_con_traza(
-                    "obtener_estadisticas_padron",
-                    args_stats_det,
-                    emitir_evento=emitir_evento,
-                )
-                trazas_mcp.append(traza_s)
-                if stats_obs.get("ok") is not False:
-                    estadisticas = stats_obs
+                    trazas_mcp.append(traza_s)
+                    if stats_obs.get("ok") is not False:
+                        estadisticas = stats_obs
+                filas_reporte = list(activos_mencionados)
 
             if not respuesta_llm:
                 respuesta_llm = self._construir_sintesis_ejecutiva_padron(
                     filtros_det=filtros_det,
                     estadisticas=estadisticas,
-                    activos_mencionados=activos_mencionados,
+                    activos_mencionados=filas_reporte or activos_mencionados,
                     total_coincidencias_db=total_coincidencias_db,
                     formatos_exportacion=formatos_exportacion,
+                    fuente_reporte=fuente_reporte,
+                    columnas_seleccionadas=columnas_seleccionadas,
                 )
-                if not usar_react and settings.env != "test":
+                if settings.env != "test":
                     await _emitir(
                         emitir_evento,
                         {
                             "tipo": "paso",
                             "id": "sintesis-padron",
-                            "etiqueta": "Consolidando síntesis ejecutiva del informe",
-                            "detalle": "Resumen verificado con datos del padrón",
+                            "etiqueta": "Consolidando síntesis verificada del reporte",
+                            "detalle": (
+                                f"{total_coincidencias_db} registro(s) en fuente {fuente_reporte}"
+                                + (f" · {len(columnas_seleccionadas)} columnas" if columnas_seleccionadas else "")
+                            ),
                             "duracionMs": 5,
                             "estado": "completado",
                         },
@@ -2098,6 +2521,14 @@ class McpBridgeService:
             return ConsultaAnaliticaResponse(
                 motor_utilizado=motor_usado,  # type: ignore[arg-type]
                 modelo=modelo_usado,
+                ia_activa=ia_activa,
+                motivo_respaldo=motivo_respaldo,
+                fuente_reporte=fuente_reporte,  # type: ignore[arg-type]
+                titulo_sugerido=titulo_sugerido,
+                columnas_disponibles=columnas_disponibles,
+                columnas_seleccionadas=columnas_seleccionadas,
+                filas_reporte=filas_reporte,
+                total_registros=total_coincidencias_db,
                 respuesta=respuesta_llm,
                 filtros_detectados=filtros_det,
                 activos_mencionados=activos_mencionados[:12],
@@ -2105,6 +2536,7 @@ class McpBridgeService:
                 trazas_mcp=trazas_mcp,
                 formatos_exportacion=formatos_exportacion,  # type: ignore[arg-type]
                 incluir_graficas=incluir_graficas,
+                advertencias=advertencias,
                 fuera_de_ambito=False,
                 tokens_usados=tokens_usados,
             )
@@ -2119,30 +2551,44 @@ class McpBridgeService:
         activos_mencionados: list[dict[str, Any]],
         total_coincidencias_db: int,
         formatos_exportacion: list[str],
+        fuente_reporte: str = "PADRON",
+        columnas_seleccionadas: list[str] | None = None,
     ) -> str:
         criterios_txt = self._explicar_filtros(filtros_det).rstrip(".")
+        etiquetas_fuente = {
+            "PADRON": "Padrón Patrimonial",
+            "ALTAS": "Registro de Altas e Ingresos",
+            "BAJAS": "Registro de Bajas Patrimoniales",
+            "ASIGNACIONES": "Historial de Asignaciones y Custodia",
+            "TRANSFERENCIAS": "Registro de Transferencias entre Unidades",
+            "REVALUOS": "Historial de Revalúos Técnicos (R.R. 567/2018)",
+            "LEVANTAMIENTOS": "Levantamientos Físicos e Inspecciones Móviles",
+        }
+        nombre_fuente = etiquetas_fuente.get(fuente_reporte, "Padrón Patrimonial")
         total_filtrados = int(
-            (estadisticas or {}).get("totalActivos")
-            or total_coincidencias_db
+            total_coincidencias_db
+            or (estadisticas or {}).get("totalActivos")
             or len(activos_mencionados)
         )
         if total_filtrados == 0:
             return (
-                f"No se identificaron activos fijos que cumplan exactamente con los criterios aplicados "
-                f"({criterios_txt}). Verifique la dependencia, estado o palabra clave e intente ajustar la consulta."
+                f"No se identificaron registros en {nombre_fuente} que cumplan exactamente con los criterios aplicados "
+                f"({criterios_txt}). Verifique la unidad, rango de fechas, estado o término de búsqueda e intente ajustar la consulta."
             )
 
         valor_total = float(
             (estadisticas or {}).get("valorTotalBs")
             if estadisticas and estadisticas.get("valorTotalBs") is not None
-            else sum(float(a.get("valorBs") or 0) for a in activos_mencionados)
+            else sum(float(a.get("valorBs") or a.get("nuevoValorBs") or a.get("valorFinalBs") or 0) for a in activos_mencionados)
         )
         valor_fmt = formatear_bs(valor_total)
 
         partes: list[str] = [
             (
-                f"El presente informe consolida {total_filtrados} bien(es) patrimoniales bajo los criterios aplicados "
-                f"({criterios_txt}), con un valor contable acumulado de {valor_fmt}."
+                f"El presente reporte de {nombre_fuente} consolida {total_filtrados} registro(s) bajo los criterios aplicados "
+                f"({criterios_txt}), con un monto acumulado de {valor_fmt}."
+                if valor_total > 0
+                else f"El presente reporte de {nombre_fuente} consolida {total_filtrados} registro(s) bajo los criterios aplicados ({criterios_txt})."
             )
         ]
 
@@ -2151,7 +2597,12 @@ class McpBridgeService:
         ]
         if por_estado:
             items_est = [
-                f"{int(e.get('cantidad') or 0)} en estado {e.get('estado')} ({formatear_bs(float(e.get('valorBs') or 0))})"
+                f"{int(e.get('cantidad') or 0)} en estado {e.get('estado')}"
+                + (
+                    f" ({formatear_bs(float(e.get('valorBs') or 0))})"
+                    if float(e.get("valorBs") or 0) > 0
+                    else ""
+                )
                 for e in por_estado
                 if int(e.get("cantidad") or 0) > 0
             ]
@@ -2170,20 +2621,12 @@ class McpBridgeService:
             val_g = formatear_bs(float(g0.get("valorBs") or 0))
             if nombre_g and cant_g > 0:
                 partes.append(
-                    f"El principal grupo contable corresponde a {nombre_g} ({cant_g} bien(es), {val_g})."
+                    f"La categoría predominante corresponde a {nombre_g} ({cant_g} registro(s)"
+                    + (f", {val_g})." if float(g0.get("valorBs") or 0) > 0 else ").")
                 )
 
-        ordenados = sorted(
-            [a for a in activos_mencionados if isinstance(a, dict) and a.get("codigo")],
-            key=lambda x: float(x.get("valorBs") or 0),
-            reverse=True,
-        )[:3]
-        if ordenados:
-            ejemplos = [
-                f"{a.get('codigo')} — {str(a.get('descripcion') or 'Activo')[:42].rstrip()} ({a.get('estado') or 'ACTIVO'}, {formatear_bs(float(a.get('valorBs') or 0))})"
-                for a in ordenados
-            ]
-            partes.append(f"Activos destacados del lote: {'; '.join(ejemplos)}.")
+        if columnas_seleccionadas:
+            partes.append(f"Columnas configuradas en tabla y exportación: {len(columnas_seleccionadas)} campo(s) activos.")
 
         if formatos_exportacion:
             partes.append(
@@ -2283,7 +2726,7 @@ class McpBridgeService:
                     )
                     parsed = extraer_json_objeto(res.contenido)
                     if parsed and isinstance(parsed.get("diagnostico_ejecutivo"), str):
-                        motor_id, _ = _resolver_motor(settings)
+                        motor_id, _ = _resolver_motor(settings, res.proveedor)
                         return DiagnosticoMetricasResponse(
                             motor_utilizado=motor_id,  # type: ignore[arg-type]
                             modelo=res.modelo,

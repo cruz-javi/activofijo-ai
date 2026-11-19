@@ -46,12 +46,14 @@ logs/
 *.log
 
 # Artefactos entrenados pesados y datasets locales
-models/*.joblib
+models/whisper/
 models/*.pkl
 models/*.onnx
 models/*.pt
 models/*.safetensors
 !models/.gitkeep
+!models/pronostico_rf_v1.joblib
+!models/pronostico_rf_v1.metadata.json
 *.csv
 *.parquet
 *.xlsx

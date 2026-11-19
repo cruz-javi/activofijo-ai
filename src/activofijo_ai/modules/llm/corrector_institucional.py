@@ -22,6 +22,8 @@ _LEXICO_INSTITUCIONAL: dict[str, str] = {
         "auditoría",
         "computación",
         "telecomunicaciones",
+        "informática",
+        "ingeniería",
         "veterinaria",
         "veterinarias",
         "tecnología",
@@ -261,7 +263,13 @@ _FACULTADES_OFICIALES_UAGRM: tuple[tuple[tuple[str, ...], str], ...] = (
             "facultad de ciencias de la computacion",
             "facultad de cs de la computacion",
             "facultad de computacion",
+            "facultad de ingenieria informatica",
+            "facultad de ingenieria en sistemas",
+            "facultad de ingenieria de sistemas",
             "ciencias de la computacion",
+            "ingenieria informatica",
+            "ingenieria en sistemas",
+            "ingenieria de sistemas",
             "ficct",
             "la fic",
         ),
@@ -398,6 +406,18 @@ def corregir_texto_institucional(texto: str) -> str:
         r"\b(como)\s+representan\b",
         r"\1 representante",
         texto,
+        flags=re.IGNORECASE,
+    )
+    salida = re.sub(
+        r"\bnecesit[uú][mn]\b",
+        "Necesito un",
+        salida,
+        flags=re.IGNORECASE,
+    )
+    salida = re.sub(
+        r"\brepote(s)?\b",
+        r"reporte\1",
+        salida,
         flags=re.IGNORECASE,
     )
 

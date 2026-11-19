@@ -285,12 +285,138 @@ _PALABRAS_NO_SEARCH: frozenset[str] = frozenset(
         "biblioteca", "medicina", "prado", "yabare", "decanato", "auditorio", "postgrado",
         "derecho", "economia", "humanidades", "contaduria", "contables", "auditoria",
         "agricolas", "agronomia", "juridicas", "politicas", "camiri", "montero",
-        "vallecito", "cpd", "almacen",
+        "vallecito", "cpd", "almacen", "dtic", "finor", "fich", "habitat", "politecnica",
+        "valles", "crucenos", "farmaceuticas", "bioquimicas", "economicas", "integrales",
+        # Verbos y sustantivos de formato, columnas, fechas y eventos de reporte
+        "incluya", "incluyan", "incluir", "incluyendo", "incluido", "incluidos",
+        "muestre", "muestren", "muestra", "mostrando", "columna", "columnas",
+        "campo", "campos", "dato", "datos", "detalle", "detalles", "tabla",
+        "codigo", "codigos", "descripcion", "descripciones", "grupo", "grupos",
+        "contable", "ubicacion", "ubicaciones", "custodio", "custodios",
+        "responsable", "responsables", "encargado", "encargados", "funcionario", "funcionarios",
+        "modelo", "modelos", "serie", "series", "placa", "placas", "factura", "facturas",
+        "proveedor", "proveedores", "documento", "documentos", "resolucion", "resoluciones",
+        "respaldo", "respaldos", "motivo", "motivos", "causal", "causales",
+        "observacion", "observaciones", "depreciacion", "acumulada", "neto", "residual",
+        "vida", "util", "meses", "anterior", "final", "origen", "destino",
+        "fecha", "fechas", "adquisicion", "ingreso", "ingresos", "alta", "altas",
+        "asignacion", "asignaciones", "reasignacion", "reasignaciones", "entrega", "entregas",
+        "custodia", "transferencia", "transferencias", "traslado", "traslados",
+        "revaluo", "revaluos", "revalorizacion", "revalorizaciones", "peritaje", "perito",
+        "levantamiento", "levantamientos", "inspeccion", "inspecciones", "planilla", "planillas",
+        "hallazgo", "hallazgos", "inspector", "revision", "conciliado", "pendiente",
+        "faltante", "faltantes", "sobrante", "sobrantes", "encontrado", "encontrados",
+        "vigente", "vigentes", "historico", "historicos", "autorizador", "tecnico",
+        "unicamente", "exclusivamente", "exactamente", "estrictamente", "ordenado", "ordenados",
+        "ordenada", "ordenadas", "orden", "reciente", "recientes", "antiguo", "antiguos",
+        "ultimo", "ultimos", "ultima", "ultimas", "primero", "primeros", "primera", "primeras",
+        "caro", "caros", "barato", "baratos", "costoso", "costosos", "top",
+        "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+        "septiembre", "setiembre", "octubre", "noviembre", "diciembre",
+        "realizado", "realizados", "realizada", "realizadas", "efectuado", "efectuados",
+        "efectuada", "efectuadas", "ejecutado", "ejecutados", "aplicado", "aplicados",
+        "emitido", "emitidos", "emitida", "emitidas", "acta", "actas", "nro", "numero",
+        "fisico", "fisicos", "fisica", "fisicas", "movil", "moviles", "verificacion",
+        "patrimonial", "patrimoniales", "institucional", "institucionales", "general", "generales",
+        "detallado", "detallados", "detallada", "detalladas", "ejecutivo", "ejecutivos",
+        "oficial", "oficiales", "mensual", "anual", "gestiones", "periodo", "periodos",
+        "rango", "rangos", "recibidos", "contabilizados", "vigencia", "actual",
+        "actuales", "consolidado", "consolidados", "completo", "completa", "completos",
+        "necesitum", "necesitun", "repote", "repotes", "ingenieria", "informatica",
+        "sistemas", "redes", "industrial", "civil", "mecanica", "electrica", "electronica",
+        "quimica", "petrolera", "ambiental", "alimentos", "comercial", "administracion",
+        "odontologia", "enfermeria", "biologia", "forestal", "arte", "diseno", "psicologia",
+        "educacion", "idiomas", "turismo", "sociologia", "filosofia", "historia",
+        "adquirido", "adquiridos", "adquirida", "adquiridas", "comprado", "comprados",
+        "comprada", "compradas", "incorporado", "incorporados", "incorporada", "incorporadas",
     }
+)
+
+_CATALOGO_BIENES_SEARCH: tuple[str, ...] = (
+    "aire acondicionado",
+    "central telefonica",
+    "proyector",
+    "datashow",
+    "televisor",
+    "impresora",
+    "fotocopiadora",
+    "microscopio",
+    "esterilizador",
+    "espectrofotometro",
+    "centrifuga",
+    "autoclave",
+    "incubadora",
+    "osciloscopio",
+    "destilador",
+    "balanza",
+    "servidor",
+    "camioneta",
+    "vagoneta",
+    "motocicleta",
+    "tractor",
+    "automovil",
+    "escritorio",
+    "estante",
+    "archivador",
+    "casillero",
+    "gavetero",
+    "armario",
+    "vitrina",
+    "pupitre",
+    "butaca",
+    "camilla",
+    "scanner",
+    "escaner",
+    "plotter",
+    "sillon",
+    "silla",
+    "mesa",
+    "sofa",
+    "monitor",
+    "router",
+    "switch",
+    "ups",
+    "pizarra",
+    "generador",
+    "compresor",
+    "taladro",
+    "soldador",
+    "refrigerador",
+    "heladera",
+    "ventilador",
+    "extintor",
+    "dron",
+    "drone",
+    "camara",
+    "thinkpad",
+    "prodesk",
+    "catalyst",
+    "epson",
+    "cisco",
+    "lenovo",
+    "dell",
+    "toyota",
+    "nissan",
+    "samsung",
+    "hikvision",
+    "mikrotik",
 )
 
 
 def _extraer_termino_busqueda_residual(norm: str) -> str | None:
+    if any(
+        p in norm
+        for p in (
+            "todos los activos",
+            "todos los bienes",
+            "todo el padron",
+            "total de activos",
+            "reporte de activos",
+            "listado de activos",
+        )
+    ):
+        return None
+    candidatos: list[str] = []
     for tk in re.findall(r"[a-z0-9]{3,}", norm):
         if tk.isdigit() or tk in _PALABRAS_NO_SEARCH:
             continue
@@ -298,8 +424,12 @@ def _extraer_termino_busqueda_residual(norm: str) -> str | None:
             base = tk[:-1]
             if base in _PALABRAS_NO_SEARCH:
                 continue
-            return base.upper()
-        return tk.upper()
+            candidatos.append(base.upper())
+        else:
+            candidatos.append(tk.upper())
+    # Solo usar término residual en búsquedas cortas/directas (1-2 tokens libres), jamás en oraciones largas con errores de dictado
+    if len(candidatos) == 1 and len(norm.split()) <= 5:
+        return candidatos[0]
     return None
 
 
@@ -312,24 +442,7 @@ def _resolver_search_consulta(consulta_usuario: str, norm: str) -> str | None:
     if m_cod:
         return m_cod.group(1).upper()
 
-    for palabra_clave in (
-        "aire acondicionado",
-        "proyector",
-        "impresora",
-        "microscopio",
-        "servidor",
-        "camioneta",
-        "escritorio",
-        "estante",
-        "archivador",
-        "fotocopiadora",
-        "scanner",
-        "silla",
-        "mesa",
-        "monitor",
-        "ups",
-        "pizarra",
-    ):
+    for palabra_clave in _CATALOGO_BIENES_SEARCH:
         if re.search(rf"\b{re.escape(palabra_clave)}(?:s|es)?\b", norm):
             return palabra_clave.upper()
 
@@ -343,6 +456,9 @@ _ALIAS_UBICACIONES: tuple[tuple[str, str], ...] = (
     ("facultad de ciencias de la computacion", "FICCT"),
     ("facultad de cs de la computacion", "FICCT"),
     ("facultad de computacion", "FICCT"),
+    ("facultad de ingenieria informatica", "FICCT"),
+    ("facultad de ingenieria en sistemas", "FICCT"),
+    ("facultad de ingenieria de sistemas", "FICCT"),
     ("ciencias de la computacion", "FICCT"),
     ("cs de la computacion", "FICCT"),
     ("computacion y telecomunicaciones", "FICCT"),
@@ -660,6 +776,15 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
     elif any(p in norm_sin_ubicacion for p in ("patrimonio historico", "historico", "artistico", "cultural")):
         grupo = "Patrimonio Histórico"
 
+    def _es_anio_sin_moneda(valor: float, texto_match: str, inicio: int) -> bool:
+        if not (1990 <= valor <= 2099 and float(valor).is_integer()):
+            return False
+        ventana = norm[max(0, inicio - 18) : min(len(norm), inicio + len(texto_match) + 12)]
+        return not any(
+            k in ventana
+            for k in ("bs", "boliviano", "valor", "monto", "precio", "costo", "mayor", "menor", "superior", "inferior")
+        )
+
     valor_min: float | None = None
     valor_max: float | None = None
     m_rango = re.search(
@@ -669,7 +794,14 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
     if m_rango:
         v1 = _parse_monto_bo(m_rango.group(1))
         v2 = _parse_monto_bo(m_rango.group(2))
-        if v1 is not None and v2 is not None:
+        if (
+            v1 is not None
+            and v2 is not None
+            and not (
+                _es_anio_sin_moneda(v1, m_rango.group(0), m_rango.start())
+                and _es_anio_sin_moneda(v2, m_rango.group(0), m_rango.start())
+            )
+        ):
             valor_min = min(v1, v2)
             valor_max = max(v1, v2)
     else:
@@ -679,21 +811,32 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
         ):
             m_min = re.search(pat_min, norm)
             if m_min:
-                valor_min = _parse_monto_bo(m_min.group(1))
+                cand_min = _parse_monto_bo(m_min.group(1))
+                if cand_min is not None and not _es_anio_sin_moneda(cand_min, m_min.group(0), m_min.start()):
+                    valor_min = cand_min
                 break
         m_max = re.search(
             r"(?:menor(?:es)?\s*(?:a|que|de)|inferior(?:es)?\s*(?:a|que)|menos\s+de|hasta|como\s+maximo|<=?|<)\s*(?:bs\.?\s*)?(\d+(?:[.,]\d+)?)",
             norm,
         )
         if m_max:
-            valor_max = _parse_monto_bo(m_max.group(1))
+            cand_max = _parse_monto_bo(m_max.group(1))
+            if cand_max is not None and not _es_anio_sin_moneda(cand_max, m_max.group(0), m_max.start()):
+                valor_max = cand_max
 
+    tiene_rango_anios = bool(
+        re.search(
+            r"\b(?:entre|desde|del|de|en\s+el\s+a[nñ]o|a[nñ]os?)?\s*(?:199\d|20\d{2})\s*(?:y|a|al|hasta|-|/)\s*(?:199\d|20\d{2}|\d{2})\b",
+            norm,
+        )
+    )
     gestion: int | None = None
-    m_anio = re.search(r"\b(199\d|20\d{2})\b", norm)
-    if m_anio:
-        gestion = int(m_anio.group(1))
+    if not tiene_rango_anios:
+        m_anio = re.search(r"\b(199\d|20\d{2})\b", norm)
+        if m_anio:
+            gestion = int(m_anio.group(1))
 
-    search = _resolver_search_consulta(consulta_usuario, norm_sin_ubicacion)
+    search = _resolver_search_consulta(consulta_corregida, norm_sin_ubicacion)
 
     return {
         "search": search,
@@ -1284,33 +1427,74 @@ async def consultar_proyeccion_random_forest(horizonte_meses: int = 6) -> dict[s
     )
 
 
+async def ejecutar_reporte_dinamico(
+    fuente: str = "PADRON",
+    unidad: str | None = None,
+    estado: str | None = None,
+    condicion: str | None = None,
+    grupo_contable: str | None = None,
+    marca: str | None = None,
+    modelo: str | None = None,
+    custodio: str | None = None,
+    search: str | None = None,
+    valor_min: float | None = None,
+    valor_max: float | None = None,
+    gestion: int | None = None,
+    fecha_desde: str | None = None,
+    fecha_hasta: str | None = None,
+    ordenar_por: str | None = None,
+    orden_dir: str | None = None,
+    limit: int = 50,
+    columnas: list[str] | None = None,
+) -> dict[str, Any]:
+    """Ejecuta un reporte parametrizado multi-fuente (PADRON, ALTAS, BAJAS, ASIGNACIONES, TRANSFERENCIAS, REVALUOS, LEVANTAMIENTOS) con columnas dinámicas y RBAC."""
+    cliente, seg = _obtener_cliente_y_seguridad()
+    return await cliente.post_internal(
+        "reporte-dinamico",
+        {
+            "fuente": (fuente or "PADRON").strip().upper(),
+            "unidad": _normalizar_unidad_stats(unidad),
+            "estado": _normalizar_param_opcional(estado),
+            "condicion": _normalizar_param_opcional(condicion),
+            "grupoContable": _normalizar_param_opcional(grupo_contable),
+            "marca": _normalizar_param_opcional(marca),
+            "modelo": _normalizar_param_opcional(modelo),
+            "custodio": _normalizar_param_opcional(custodio),
+            "search": _normalizar_param_opcional(search),
+            "valorMin": valor_min,
+            "valorMax": valor_max,
+            "gestion": gestion,
+            "fechaDesde": _normalizar_param_opcional(fecha_desde),
+            "fechaHasta": _normalizar_param_opcional(fecha_hasta),
+            "ordenarPor": _normalizar_param_opcional(ordenar_por),
+            "ordenDir": _normalizar_param_opcional(orden_dir),
+            "limit": max(1, min(int(limit or 50), 500)),
+            "columnas": columnas if isinstance(columnas, list) and columnas else None,
+            "seguridad": seg,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Primitiva 3: Plantillas de Instrucción MCP (Prompts)
 # ---------------------------------------------------------------------------
 
 
 def prompt_redaccion_carta_uagrm(recurso_mcp_json: str, instruccion_usuario: str) -> str:
-    """Plantilla estructurada de análisis semántico para redactar cartas formales extensas UAGRM."""
+    """Plantilla compacta y de alta precisión para cartas oficiales UAGRM (optimizada para CPU local y Groq)."""
     return (
-        "Analiza la solicitud administrativa universitaria UAGRM (Bolivia) y genera los bloques "
-        "semánticos de alto nivel formal para redactar una carta oficial seria, extensa y precisa.\n\n"
-        "ANTECEDENTES OFICIALES:\n"
-        f"{recurso_mcp_json}\n\n"
-        "SOLICITUD DEL USUARIO:\n"
-        f"{instruccion_usuario}\n\n"
-        "REGLAS ESTRICTAS:\n"
-        "1. Corrige ortografía y errores de dictado (ej. 'famultad' -> 'Facultad', 'conturia' -> 'Contaduría').\n"
-        "2. Usa EXCLUSIVAMENTE la unidad o facultad mencionada por el usuario; JAMÁS menciones ni inventes otra facultad distinta.\n"
-        "3. PROHIBIDO inventar precios o montos en Bs., códigos patrimoniales ni estados físicos que no estén en los antecedentes.\n"
-        "4. PROHIBIDO usar palabras técnicas internas ('MCP', 'JSON', 'true', 'false', 'recurso activo') ni encabezados ('Señor...').\n"
-        "5. Redacta cada campo en prosa institucional boliviana formal, específica al pedido real del usuario:\n"
-        '   - "asunto_especifico": título oficial en MAYÚSCULAS resumiendo el trámite y bien solicitado.\n'
-        '   - "unidad_solicitante": nombre correcto y oficial de la facultad o unidad solicitante.\n'
-        '   - "objeto_concreto": frase sustantiva formal que describe exactamente qué se solicita (ej. "la adquisición e incorporación de cuatro (4) televisores destinados al equipamiento audiovisual de las aulas y laboratorios").\n'
-        '   - "justificacion_tecnica": 2 a 3 oraciones sólidas y coherentes explicando la necesidad académica, técnica u operativa concreta de este caso específico.\n'
-        '   - "impacto_institucional": 1 a 2 oraciones formales sobre el beneficio esperado para docencia, investigación, control patrimonial o continuidad operativa.\n'
-        '   - "detalle_complementario": 1 oración formal con precisiones específicas mencionadas por el usuario (fallas, destino, marca, plazos), o "" si no aplica.\n\n'
-        "Devuelve EXCLUSIVAMENTE un objeto JSON válido con esas 6 claves exactas."
+        "Redacta bloques formales en español boliviano para una carta administrativa UAGRM.\n"
+        "Reglas: corrige ortografía de dictado ('famultad'->'Facultad', 'conturia'->'Contaduría'); "
+        "usa EXCLUSIVAMENTE la facultad del usuario; PROHIBIDO inventar precios en Bs., códigos o usar palabras técnicas ('MCP', 'JSON', 'true', 'false').\n"
+        "Devuelve SOLO un objeto JSON válido con estas 6 claves rellenas con prosa formal específica (no copies estas definiciones):\n"
+        "- asunto_especifico: título oficial en MAYÚSCULAS resumiendo trámite y bien\n"
+        "- unidad_solicitante: nombre oficial corregido de la unidad o facultad\n"
+        "- objeto_concreto: frase sustantiva formal del requerimiento\n"
+        "- justificacion_tecnica: 2 oraciones sólidas sobre la necesidad técnica o académica concreta\n"
+        "- impacto_institucional: 1 a 2 oraciones sobre el beneficio operativo o docente\n"
+        "- detalle_complementario: precisión adicional del pedido o cadena vacía\n\n"
+        f"Antecedentes:\n{recurso_mcp_json}\n\n"
+        f"Pedido del usuario:\n{instruccion_usuario}"
     )
 
 
@@ -1378,6 +1562,7 @@ def crear_servidor_mcp() -> FastMCP:
         consultar_riesgo_normativo,
         consultar_trazabilidad_sha256,
         consultar_proyeccion_random_forest,
+        ejecutar_reporte_dinamico,
     ):
         servidor.tool()(herramienta)
 
