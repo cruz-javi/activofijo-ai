@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -e
 
+echo "=== 0. Verificando Swap en EC2 (proteccion t3.small) ==="
+if ! swapon --show | grep -q '/swapfile'; then
+  echo "Activando 4 GB de Swap en /swapfile..."
+  sudo fallocate -l 4G /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096 status=none
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+fi
+free -h
+
 echo "=== 1. Ajustando permisos en ~/app ==="
 sudo chown -R ubuntu:ubuntu ~/app
 
@@ -42,22 +53,28 @@ if [ -f ~/app/.env ]; then
   fi
 fi
 
-echo "=== 4. Compilando y levantando contenedores secuencialmente ==="
+echo "=== 4. Liberando RAM temporalmente y compilando secuencialmente ==="
 cd ~/app
+docker compose stop || true
+
 docker compose build core
-docker compose up -d --force-recreate core
-
 docker compose build ai
-docker compose up -d --force-recreate ai
+docker compose build --build-arg NODE_OPTIONS="--max-old-space-size=1536" web || docker compose build web
 
-docker compose build web
-docker compose up -d --force-recreate web
-
+echo "=== 5. Levantando todos los contenedores ==="
+docker compose up -d --force-recreate core ai web
 docker image prune -f
 docker compose ps
 
-echo "=== 5. Verificando salud ==="
-sleep 4
+echo "=== 6. Verificando variables criticas en ~/app/.env ==="
+for var in SESSION_SECRET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY LLM_API_KEY; do
+  if ! grep -q "^${var}=.\+" ~/app/.env 2>/dev/null; then
+    echo "ATENCION: Falta definir ${var} con valor real en ~/app/.env"
+  fi
+done
+
+echo "=== 7. Verificando salud ==="
+sleep 6
 echo -n "Core: " && curl -s http://127.0.0.1:3000/health && echo ""
 echo -n "AI:   " && curl -s http://127.0.0.1:8000/health && echo ""
 echo "Web:" && curl -I -s http://127.0.0.1:3001 | head -n 5
