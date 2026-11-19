@@ -55,7 +55,7 @@ def create_app() -> FastAPI:
         """Precalienta ONNX, Whisper local y Ollama en RAM en segundo plano."""
         obtener_motor_rapidocr_compartido()
         settings = _app.dependency_overrides.get(get_settings, get_settings)()
-        if settings.env != "test":
+        if settings.env != "test" and settings.llm_provider.lower() == "ollama":
             asyncio.create_task(
                 asyncio.to_thread(
                     obtener_modelo_whisper_compartido,
