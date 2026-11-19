@@ -66,12 +66,13 @@ def cargar_series_csv(ruta_csv: Path) -> list[dict[str, float]]:
 
 def entrenar_y_exportar(
     forzar_regenerar_dataset: bool = True,
+    origen_dataset: str = "faker",
 ) -> dict[str, Any]:
     datasets_dir = RAIZ_AI / "training" / "datasets"
     ruta_series = datasets_dir / "series_mensuales_uagrm.csv"
     ruta_movs = datasets_dir / "movimientos_patrimoniales_faker.csv"
 
-    if forzar_regenerar_dataset or not ruta_series.is_file() or not ruta_movs.is_file():
+    if forzar_regenerar_dataset or not ruta_series.is_file():
         ruta_movs, ruta_series = generar_datasets_faker(datasets_dir)
 
     filas = cargar_series_csv(ruta_series)
@@ -101,7 +102,7 @@ def entrenar_y_exportar(
         y = np.array(y_list, dtype=float)
         gest_arr = np.array(gestiones, dtype=int)
 
-        # Validación temporal hold-out: entrenar 2017-2024 y evaluar 2025-2026
+        # Validación temporal hold-out: entrenar <=2024 y evaluar 2025-2026
         mask_train = gest_arr <= 2024
         mask_test = gest_arr >= 2025
 
@@ -115,7 +116,7 @@ def entrenar_y_exportar(
         ss_tot = float(np.sum((y[mask_test] - np.mean(y[mask_test])) ** 2))
         holdout_r2 = max(0.0, 1.0 - ss_res / ss_tot) if ss_tot > 1e-9 else 0.0
 
-        # Entrenamiento final sobre todo el histórico 2017-2026 para producción
+        # Entrenamiento final sobre todo el histórico para producción
         rf_full = RandomForestRegressorNumpy(
             n_estimators=100, max_depth=6, min_samples_split=4, min_samples_leaf=2, random_state=100 + idx_obj
         ).fit(X, y)
@@ -130,8 +131,20 @@ def entrenar_y_exportar(
             "holdout_2025_2026_rmse": round(holdout_rmse, 2),
         }
 
-    with ruta_movs.open("r", encoding="utf-8") as fh:
-        total_movimientos = max(0, sum(1 for _ in fh) - 1)
+    total_movimientos = 10000
+    if ruta_movs.is_file() and origen_dataset == "faker":
+        with ruta_movs.open("r", encoding="utf-8") as fh:
+            total_movimientos = max(0, sum(1 for _ in fh) - 1)
+    else:
+        total_movimientos = int(
+            sum(
+                f["altas_cant"] + f["bajas_cant"] + f["reasignaciones_cant"] + f["revaluos_cant"]
+                for f in filas
+            )
+        )
+
+    anio_min = int(min(f["gestion"] for f in filas)) if filas else 2016
+    anio_max = int(max(f["gestion"] for f in filas)) if filas else 2026
 
     artefacto = {
         "version": "rf-patrimonio-v1.0",
@@ -140,9 +153,10 @@ def entrenar_y_exportar(
         "n_estimators": 100,
         "feature_names": list(FEATURE_NAMES),
         "dataset_info": {
+            "origen": origen_dataset,
             "periodos_mensuales": len(filas),
-            "movimientos_faker": total_movimientos,
-            "gestiones": "2017-2026",
+            "movimientos_totales": total_movimientos,
+            "gestiones": f"{anio_min}-{anio_max}",
         },
         "medias_entrenamiento": medias_entrenamiento,
         "metricas_validacion": metricas_validacion,
@@ -164,5 +178,9 @@ def entrenar_y_exportar(
 
 
 if __name__ == "__main__":
-    resultado = entrenar_y_exportar(forzar_regenerar_dataset=True)
+    usar_csv_existente = "--desde-csv" in sys.argv
+    resultado = entrenar_y_exportar(
+        forzar_regenerar_dataset=not usar_csv_existente,
+        origen_dataset="neon-uagrm-10k" if usar_csv_existente else "faker",
+    )
     print(json.dumps(resultado, indent=2, ensure_ascii=False))

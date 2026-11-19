@@ -334,6 +334,26 @@ _FACULTADES_OFICIALES_UAGRM: tuple[tuple[tuple[str, ...], str], ...] = (
         "Facultad Politécnica",
     ),
     (
+        ("facultad integral del norte", "finor", "montero"),
+        "Facultad Integral del Norte (FINOR - Montero)",
+    ),
+    (
+        ("facultad integral del chaco", "fich", "camiri"),
+        "Facultad Integral del Chaco (FICH - Camiri)",
+    ),
+    (
+        ("facultad integral de los valles", "valles crucenos", "fivc"),
+        "Facultad Integral de los Valles Cruceños (FIVC)",
+    ),
+    (
+        ("direccion de tecnologias de la informacion", "dtic", "cpd"),
+        "Dirección de Tecnologías de la Información y Comunicación (DTIC / CPD)",
+    ),
+    (
+        ("departamento de activo fijo", "activo fijo y control patrimonial"),
+        "Departamento de Activo Fijo y Control Patrimonial",
+    ),
+    (
         ("centro experimental el prado", "el prado"),
         "Centro Experimental El Prado (F.C.V.)",
     ),
