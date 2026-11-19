@@ -1,0 +1,88 @@
+services:
+  core:
+    build:
+      context: ./activofijo-core
+      dockerfile: docker/Dockerfile
+    container_name: activofijo-core
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATA_SOURCE_MODE: ${DATA_SOURCE_MODE:-hybrid}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      DATABASE_URL: ${DATABASE_URL}
+      DIRECT_DATABASE_URL: ${DIRECT_DATABASE_URL}
+      LEGACY_DATABASE_URL: ${LEGACY_DATABASE_URL}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-15m}
+      JWT_2FA_SECRET: ${JWT_2FA_SECRET}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
+      TOTP_ISSUER: ${TOTP_ISSUER:-UAGRM Activo Fijo}
+      REFRESH_TOKEN_EXPIRES_DAYS: ${REFRESH_TOKEN_EXPIRES_DAYS:-7}
+      CORS_ORIGIN: ${CORS_ORIGIN:-https://activofijo.javi-dev.me,http://localhost:3001}
+      AWS_REGION: ${AWS_REGION:-us-east-2}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_S3_BUCKET_NAME: ${AWS_S3_BUCKET_NAME:-activofijo-archivos}
+      AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT:-}
+      AI_SERVICE_ENABLED: ${AI_SERVICE_ENABLED:-true}
+      AI_SERVICE_URL: ${AI_SERVICE_URL:-http://activofijo-ai:8000}
+      AI_INTERNAL_API_KEY: ${AI_INTERNAL_API_KEY}
+      AI_REQUEST_TIMEOUT_MS: ${AI_REQUEST_TIMEOUT_MS:-165000}
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - activofijo-net
+
+  web:
+    build:
+      context: ./activofijo-web
+      dockerfile: docker/Dockerfile
+    container_name: activofijo-web
+    restart: unless-stopped
+    depends_on:
+      - core
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      CORE_API_URL: http://core:3000
+      NEXT_PUBLIC_CORE_API_URL: ${NEXT_PUBLIC_CORE_API_URL:-https://activofijo.javi-dev.me/api/proxy}
+      SESSION_SECRET: ${SESSION_SECRET}
+    ports:
+      - "3001:3001"
+    networks:
+      - activofijo-net
+
+  ai:
+    build:
+      context: ./activofijo-ai
+      dockerfile: Dockerfile
+    container_name: activofijo-ai
+    restart: unless-stopped
+    depends_on:
+      - core
+    environment:
+      PORT: 8000
+      ENV: production
+      AI_INTERNAL_API_KEY: ${AI_INTERNAL_API_KEY}
+      CORE_INTERNAL_URL: http://core:3000
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.groq.com/openai/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-qwen/qwen3.8-27b}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-45}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-1024}
+      LLM_FALLBACK_PROVIDER: ${LLM_FALLBACK_PROVIDER:-groq}
+      LLM_FALLBACK_BASE_URL: ${LLM_FALLBACK_BASE_URL:-https://api.groq.com/openai/v1}
+      LLM_FALLBACK_API_KEY: ${LLM_FALLBACK_API_KEY:-}
+      LLM_FALLBACK_MODEL: ${LLM_FALLBACK_MODEL:-qwen/qwen3.8-27b}
+      LLM_FALLBACK_TIMEOUT_SECONDS: ${LLM_FALLBACK_TIMEOUT_SECONDS:-25}
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks:
+      - activofijo-net
+
+networks:
+  activofijo-net:
+    name: activofijo-net
+    driver: bridge
