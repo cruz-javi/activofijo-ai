@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     llm_base_url: str = Field(default="http://localhost:11434/v1")
     llm_api_key: str = Field(default="")
     llm_model: str = Field(default="uagrm-activo-fijo")
-    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    llm_timeout_seconds: float = Field(default=180.0, gt=0)
     llm_max_tokens: int = Field(default=1024, gt=0, le=8192)
     whisper_model: str = Field(default="base")
 

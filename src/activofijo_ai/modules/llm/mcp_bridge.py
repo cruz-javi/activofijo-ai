@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -17,6 +18,11 @@ from activofijo_ai.modules.llm.core_client import (
     core_bridge_ctx,
     seguridad_mcp_ctx,
 )
+from activofijo_ai.modules.llm.corrector_institucional import (
+    corregir_texto_institucional,
+    listar_facultades_mencionadas,
+    resolver_facultad_oficial_uagrm,
+)
 from activofijo_ai.modules.llm.knowledge import PALABRAS_BLOQUEO_EXTERNO
 from activofijo_ai.modules.llm.mcp_server import (
     CONDICIONES_PADRON_VALIDAS,
@@ -27,6 +33,7 @@ from activofijo_ai.modules.llm.mcp_server import (
     detectar_formatos_exportacion_reporte,
     detectar_incluir_graficas,
     extraer_destinatario_instruccion,
+    extraer_unidad_solicitante,
     formatear_bs,
     mcp_server,
     normalizar_moneda_texto,
@@ -487,11 +494,12 @@ class McpBridgeService:
         emitir_evento: EmitirEventoFn | None = None,
     ) -> RedaccionAsistidaResponse:
         trazas_mcp: list[TrazaHerramientaMcp] = []
+        instruccion_limpia = corregir_texto_institucional(payload.instruccion_usuario)
         tipo_doc = payload.tipo_documento
         if not tipo_doc:
             clasif_obs, clasif_traza = await self._llamar_tool_con_traza(
                 "clasificar_intencion_redaccion",
-                {"instruccion_usuario": payload.instruccion_usuario},
+                {"instruccion_usuario": instruccion_limpia},
                 emitir_evento=emitir_evento,
             )
             trazas_mcp.append(clasif_traza)
@@ -504,10 +512,21 @@ class McpBridgeService:
         referencia_base = str(
             plantilla.get("referencia_base") or "SOLICITUD ADMINISTRATIVA DE ACTIVO FIJO"
         )
-        dest_implicito, cargo_implicito = extraer_destinatario_instruccion(payload.instruccion_usuario)
-        exportacion_solicitada = detectar_exportacion_carta(payload.instruccion_usuario)
+        titulo_tramite = str(plantilla.get("titulo_documento") or "Solicitud Administrativa")
+        ctx_raw = payload.contexto_activo or {}
+        unidad_inferida = (
+            corregir_texto_institucional(payload.solicitante_unidad)
+            if payload.solicitante_unidad
+            else (
+                extraer_unidad_solicitante(instruccion_limpia)
+                or str(ctx_raw.get("ubicacion") or "").strip()
+                or None
+            )
+        )
+        dest_implicito, cargo_implicito = extraer_destinatario_instruccion(instruccion_limpia)
+        exportacion_solicitada = detectar_exportacion_carta(instruccion_limpia)
         edicion_parcial = (
-            detectar_edicion_parcial_carta(payload.instruccion_usuario)
+            detectar_edicion_parcial_carta(instruccion_limpia)
             if payload.borrador_actual is not None
             else {"indice_parrafo_1based": None, "toca_destinatario": False, "toca_referencia": False}
         )
@@ -528,7 +547,6 @@ class McpBridgeService:
         ).strip()
 
         es_nuevo_sin_anexo = tipo_doc == "SOLICITUD_NUEVO_ACTIVO"
-        ctx_raw = payload.contexto_activo or {}
         cod_inicial = str(payload.cod_activo or ctx_raw.get("codigo") or "").strip()
 
         ficha_mcp: dict[str, Any] = {}
@@ -553,24 +571,44 @@ class McpBridgeService:
         incluye_anexo = bool(codigo_activo and ctx_verificado and not es_nuevo_sin_anexo)
         lugar_fecha = _fecha_bolivia_formal()
 
-        recurso_mcp = {
-            "tipo_documento": tipo_doc,
-            "modo_acceso": payload.modo_acceso,
-            "incluye_anexo_tecnico": incluye_anexo,
-            "solicitante": {
-                "nombre": payload.solicitante_nombre or "Responsable / Funcionario UAGRM",
-                "cargo": payload.solicitante_cargo or "Funcionario Institucional",
-                "unidad": payload.solicitante_unidad or "Unidad Universitaria UAGRM",
-            },
-            "normativa_aplicable": normas,
-            "recurso_activo_mcp": ctx_verificado if not es_nuevo_sin_anexo else None,
-        }
+        normas_legibles = "; ".join(
+            n.replace("R.R. N°", "Resolución Rectoral N°").replace("R.R.", "Resolución Rectoral")
+            for n in normas
+        )
+        lineas_antecedentes = [
+            f"- Tipo de gestión: {titulo_tramite}",
+            f"- Solicitante: {payload.solicitante_nombre or 'Autoridad / Representante Universitario'} ({payload.solicitante_cargo or 'Representante Institucional'})",
+            f"- Unidad o Facultad solicitante: {unidad_inferida or 'Unidad Universitaria UAGRM'}",
+            f"- Destinatario: {destinatario} ({destinatario_cargo})",
+            f"- Normativa vigente aplicable: {normas_legibles or 'Decreto Supremo N° 0181 (NB-SABS) y Ley N° 1178 (SAFCO)'}",
+        ]
+        if incluye_anexo and ctx_verificado:
+            lineas_antecedentes.append(
+                "- Bien patrimonial verificado en padrón UAGRM: "
+                f"Código {codigo_activo}, "
+                f"Descripción: {ctx_verificado.get('descripcion') or 'No especificada'}, "
+                f"Ubicación actual: {ctx_verificado.get('ubicacion') or 'No especificada'}, "
+                f"Estado: {ctx_verificado.get('estado') or 'Registrado'}, "
+                f"Valor contabilizado: {ctx_verificado.get('costo_bs') or 'Sin monto detallado'} "
+                "(se adjunta ficha técnica oficial como Anexo en página 2)."
+            )
+        elif es_nuevo_sin_anexo:
+            lineas_antecedentes.append(
+                "- Modalidad: Nueva compra, adquisición o dotación de equipamiento. "
+                "No existe activo fijo previamente codificado ni precio/valor contable asignado aún."
+            )
+        else:
+            lineas_antecedentes.append(
+                "- Nota documental: Sin código patrimonial específico adjunto; redactar con base únicamente en los datos descritos por el solicitante."
+            )
+
+        antecedentes_legibles = "\n".join(lineas_antecedentes)
 
         prompt_res = await self._mcp.get_prompt(
             "prompt_redaccion_carta_uagrm",
             {
-                "recurso_mcp_json": json.dumps(recurso_mcp, ensure_ascii=False),
-                "instruccion_usuario": payload.instruccion_usuario,
+                "recurso_mcp_json": antecedentes_legibles,
+                "instruccion_usuario": instruccion_limpia,
             },
         )
         prompt_usuario = _extraer_texto_prompt_mcp(prompt_res)
@@ -594,8 +632,9 @@ class McpBridgeService:
                     {
                         "role": "system",
                         "content": (
-                            "Redactor institucional UAGRM bajo Protocolo MCP. "
-                            "Usa únicamente los códigos y valores del recurso MCP; nunca inventes cifras."
+                            "Eres Secretario Administrativo Senior de la UAGRM (Santa Cruz, Bolivia). "
+                            "Redactas cartas administrativas oficiales impecables, serias y coherentes en español boliviano. "
+                            "Jamás menciones términos internos de sistema ('MCP', 'JSON', 'true', 'false') ni inventes precios en Bs."
                         ),
                     }
                 ]
@@ -630,7 +669,7 @@ class McpBridgeService:
                                 f"Borrador actual ({len(parrafos_base)} párrafos):\n{parrafos_numerados or borrador_json}\n"
                                 f"Metadatos actuales: {borrador_json}\n\n"
                                 f"{guia_quirurgica}"
-                                f"Corrección solicitada por el usuario: {payload.instruccion_usuario}\n"
+                                f"Corrección solicitada por el usuario: {instruccion_limpia}\n"
                                 "Devuelve la carta COMPLETA en JSON estricto con estas claves:\n"
                                 '{"referencia": str, "destinatario_nombre": str|null, '
                                 '"destinatario_cargo": str|null, "cuerpo_parrafos": [str, ...], "despedida": str}'
@@ -643,7 +682,8 @@ class McpBridgeService:
                 res = await llm.generar_chat_completado(
                     mensajes=mensajes_redaccion,
                     response_format={"type": "json_object"},
-                    max_tokens_override=950,
+                    max_tokens_override=650 if payload.borrador_actual is not None else 360,
+                    temperature_override=0.2,
                 )
                 await _emitir(
                     emitir_evento,
@@ -651,73 +691,53 @@ class McpBridgeService:
                         "tipo": "paso",
                         "id": "llm-redaccion",
                         "etiqueta": "Redactando carta formal institucional",
-                        "detalle": "Borrador epistolar generado",
+                        "detalle": "Análisis semántico y redacción completados",
                         "duracionMs": int((time.perf_counter() - t_red) * 1000),
                         "estado": "completado",
                     },
                 )
                 datos = extraer_json_objeto(res.contenido)
-                if datos and isinstance(datos.get("cuerpo_parrafos"), list):
-                    validado, val_traza = await self._llamar_tool_con_traza(
-                        "validar_integridad_texto",
-                        {
-                            "cuerpo_parrafos": [str(p) for p in datos["cuerpo_parrafos"]],
-                            "contexto_activo": ctx_verificado,
-                            "cod_activo": codigo_activo,
-                            "es_nuevo_sin_anexo": es_nuevo_sin_anexo,
-                        },
-                        emitir_evento=emitir_evento,
+                if datos and payload.borrador_actual is None and not isinstance(datos.get("cuerpo_parrafos"), list):
+                    referencia_comp, parrafos_comp, _unidad_comp = self._componer_carta_desde_semantica(
+                        datos_llm=datos,
+                        tipo_doc=tipo_doc,
+                        referencia_base=referencia_base,
+                        instruccion_limpia=instruccion_limpia,
+                        unidad_inferida=unidad_inferida,
+                        ctx_verificado=ctx_verificado,
+                        ficha_mcp=ficha_mcp,
+                        codigo_activo=codigo_activo,
+                        incluye_anexo=incluye_anexo,
+                        es_nuevo_sin_anexo=es_nuevo_sin_anexo,
                     )
-                    trazas_mcp.append(val_traza)
-                    parrafos = [str(p) for p in validado.get("cuerpo_parrafos", []) if str(p).strip()]
-                    advertencias.extend(str(a) for a in validado.get("advertencias", []))
-                    if parrafos:
-                        ref_prev = payload.borrador_actual.referencia if payload.borrador_actual else None
-                        desp_prev = payload.borrador_actual.despedida if payload.borrador_actual else None
-                        referencia = normalizar_moneda_texto(
-                            str(datos.get("referencia") or ref_prev or referencia_base)
+                    if parrafos_comp:
+                        validado, val_traza = await self._llamar_tool_con_traza(
+                            "validar_integridad_texto",
+                            {
+                                "cuerpo_parrafos": parrafos_comp,
+                                "contexto_activo": ctx_verificado,
+                                "cod_activo": codigo_activo,
+                                "es_nuevo_sin_anexo": es_nuevo_sin_anexo,
+                            },
+                            emitir_evento=emitir_evento,
                         )
-                        despedida = normalizar_moneda_texto(
-                            str(
-                                datos.get("despedida")
-                                or desp_prev
-                                or "Con este motivo, saludo a usted con las consideraciones más distinguidas."
-                            )
-                        )
-                        if (
-                            payload.borrador_actual is not None
-                            and len(payload.borrador_actual.cuerpo_parrafos or []) >= 2
-                            and edicion_parcial.get("indice_parrafo_1based")
-                        ):
-                            base_p = list(payload.borrador_actual.cuerpo_parrafos or [])
-                            idx_p = int(edicion_parcial["indice_parrafo_1based"])
-                            pos = len(parrafos) - 1 if idx_p == -1 else idx_p - 1
-                            pos_base = len(base_p) - 1 if idx_p == -1 else idx_p - 1
-                            if 0 <= pos_base < len(base_p) and 0 <= pos < len(parrafos):
-                                nuevo_seg = parrafos[pos]
-                                parrafos = list(base_p)
-                                parrafos[pos_base] = nuevo_seg
-                        dest_nombre_out = (
-                            destinatario
-                            if payload.borrador_actual and not edicion_parcial.get("toca_destinatario")
-                            else (str(datos.get("destinatario_nombre") or "").strip() or destinatario)
-                        )
-                        dest_cargo_out = (
-                            destinatario_cargo
-                            if payload.borrador_actual and not edicion_parcial.get("toca_destinatario")
-                            else (str(datos.get("destinatario_cargo") or "").strip() or destinatario_cargo)
-                        )
+                        trazas_mcp.append(val_traza)
+                        parrafos_out = [str(p) for p in validado.get("cuerpo_parrafos", []) if str(p).strip()]
+                        advertencias.extend(str(a) for a in validado.get("advertencias", []))
                         motor_id, _ = _resolver_motor(settings)
                         return RedaccionAsistidaResponse(
                             motor_utilizado=motor_id,  # type: ignore[arg-type]
                             modelo=res.modelo,
                             tipo_documento_detectado=tipo_doc,  # type: ignore[arg-type]
-                            referencia=referencia,
+                            referencia=normalizar_moneda_texto(referencia_comp),
                             lugar_fecha=lugar_fecha,
-                            destinatario_nombre=dest_nombre_out,
-                            destinatario_cargo=dest_cargo_out,
-                            cuerpo_parrafos=parrafos,
-                            despedida=despedida,
+                            destinatario_nombre=destinatario,
+                            destinatario_cargo=destinatario_cargo,
+                            cuerpo_parrafos=parrafos_out,
+                            despedida=(
+                                "Con este particular, hago propicia la oportunidad para reiterar a usted las seguridades "
+                                "de mi más alta y distinguida consideración."
+                            ),
                             incluye_anexo_tecnico=incluye_anexo,
                             fundamento_normativo=normas,
                             advertencias=advertencias,
@@ -725,26 +745,120 @@ class McpBridgeService:
                             exportacion_solicitada=exportacion_solicitada,  # type: ignore[arg-type]
                             tokens_usados=res.tokens_usados,
                         )
+                if datos and isinstance(datos.get("cuerpo_parrafos"), list):
+                    parrafos_crudos_llm = [
+                        corregir_texto_institucional(str(p))
+                        for p in datos["cuerpo_parrafos"]
+                        if str(p).strip()
+                    ]
+                    motivo_rechazo = self._respuesta_carta_es_deficiente(
+                        referencia=corregir_texto_institucional(str(datos.get("referencia") or "")),
+                        parrafos=parrafos_crudos_llm,
+                        instruccion_usuario=instruccion_limpia,
+                        ctx_verificado=ctx_verificado,
+                        ficha_mcp=ficha_mcp,
+                        unidad_inferida=unidad_inferida,
+                    )
+                    if motivo_rechazo is not None:
+                        advertencias.append(motivo_rechazo)
+                    else:
+                        validado, val_traza = await self._llamar_tool_con_traza(
+                            "validar_integridad_texto",
+                            {
+                                "cuerpo_parrafos": parrafos_crudos_llm,
+                                "contexto_activo": ctx_verificado,
+                                "cod_activo": codigo_activo,
+                                "es_nuevo_sin_anexo": es_nuevo_sin_anexo,
+                            },
+                            emitir_evento=emitir_evento,
+                        )
+                        trazas_mcp.append(val_traza)
+                        parrafos = [str(p) for p in validado.get("cuerpo_parrafos", []) if str(p).strip()]
+                        advertencias.extend(str(a) for a in validado.get("advertencias", []))
+                        if parrafos:
+                            ref_prev = payload.borrador_actual.referencia if payload.borrador_actual else None
+                            desp_prev = payload.borrador_actual.despedida if payload.borrador_actual else None
+                            referencia = normalizar_moneda_texto(
+                                str(datos.get("referencia") or ref_prev or referencia_base)
+                            )
+                            despedida = normalizar_moneda_texto(
+                                str(
+                                    datos.get("despedida")
+                                    or desp_prev
+                                    or "Con este motivo, saludo a usted con las consideraciones más distinguidas."
+                                )
+                            )
+                            if (
+                                payload.borrador_actual is not None
+                                and len(payload.borrador_actual.cuerpo_parrafos or []) >= 2
+                                and edicion_parcial.get("indice_parrafo_1based")
+                            ):
+                                base_p = list(payload.borrador_actual.cuerpo_parrafos or [])
+                                idx_p = int(edicion_parcial["indice_parrafo_1based"])
+                                pos = len(parrafos) - 1 if idx_p == -1 else idx_p - 1
+                                pos_base = len(base_p) - 1 if idx_p == -1 else idx_p - 1
+                                if 0 <= pos_base < len(base_p) and 0 <= pos < len(parrafos):
+                                    nuevo_seg = parrafos[pos]
+                                    parrafos = list(base_p)
+                                    parrafos[pos_base] = nuevo_seg
+                            dest_nombre_out = (
+                                destinatario
+                                if payload.borrador_actual and not edicion_parcial.get("toca_destinatario")
+                                else (str(datos.get("destinatario_nombre") or "").strip() or destinatario)
+                            )
+                            dest_cargo_out = (
+                                destinatario_cargo
+                                if payload.borrador_actual and not edicion_parcial.get("toca_destinatario")
+                                else (str(datos.get("destinatario_cargo") or "").strip() or destinatario_cargo)
+                            )
+                            motor_id, _ = _resolver_motor(settings)
+                            return RedaccionAsistidaResponse(
+                                motor_utilizado=motor_id,  # type: ignore[arg-type]
+                                modelo=res.modelo,
+                                tipo_documento_detectado=tipo_doc,  # type: ignore[arg-type]
+                                referencia=referencia,
+                                lugar_fecha=lugar_fecha,
+                                destinatario_nombre=dest_nombre_out,
+                                destinatario_cargo=dest_cargo_out,
+                                cuerpo_parrafos=parrafos,
+                                despedida=despedida,
+                                incluye_anexo_tecnico=incluye_anexo,
+                                fundamento_normativo=normas,
+                                advertencias=advertencias,
+                                trazas_mcp=trazas_mcp,
+                                exportacion_solicitada=exportacion_solicitada,  # type: ignore[arg-type]
+                                tokens_usados=res.tokens_usados,
+                            )
             except (LlmNoConfiguradoError, LlmErrorExternoError):
                 advertencias.append(
-                    "Modelo Ollama local no disponible en este instante; borrador generado mediante motor normativo determinista MCP."
+                    "Modelo Ollama local no disponible en este instante; se aplicó redacción formal institucional."
                 )
 
         parrafos_det = self._redactar_determinista(
-            payload, tipo_doc, ctx_verificado, codigo_activo, incluye_anexo
+            payload,
+            tipo_doc,
+            ctx_verificado,
+            codigo_activo,
+            incluye_anexo,
+            unidad_inferida,
+            instruccion_limpia,
+        )
+        referencia_det = self._construir_referencia_especifica(
+            referencia_base=referencia_base,
+            tipo_doc=tipo_doc,
+            codigo_activo=codigo_activo,
+            unidad_inferida=unidad_inferida,
+            instruccion=instruccion_limpia,
+            es_nuevo_sin_anexo=es_nuevo_sin_anexo,
         )
         return RedaccionAsistidaResponse(
             motor_utilizado="respaldo_determinista",
-            modelo=f"{settings.llm_model} (respaldo-determinista)",
+            modelo=f"{settings.llm_model} (redaccion-normativa)",
             tipo_documento_detectado=tipo_doc,  # type: ignore[arg-type]
             referencia=(
                 payload.borrador_actual.referencia
                 if payload.borrador_actual and payload.borrador_actual.referencia and not edicion_parcial.get("toca_referencia")
-                else (
-                    f"{referencia_base} — {codigo_activo}"
-                    if codigo_activo and not es_nuevo_sin_anexo
-                    else referencia_base
-                )
+                else referencia_det
             ),
             lugar_fecha=lugar_fecha,
             destinatario_nombre=destinatario,
@@ -766,6 +880,353 @@ class McpBridgeService:
             tokens_usados=0,
         )
 
+    def _sanitizar_bloque_semantico(
+        self,
+        texto: Any,
+        facultades_permitidas: set[str],
+        permite_bs: bool,
+    ) -> str:
+        bruto = corregir_texto_institucional(" ".join(str(texto or "").split()).strip())
+        if not bruto:
+            return ""
+        bruto = re.sub(
+            r"^(?:se[ñn]or(?:a|\(a\))?\s+[^,.;:]+[,.;:]\s*|de\s+mi\s+mayor\s+consideraci[oó]n[,.;:]\s*)+",
+            "",
+            bruto,
+            flags=re.IGNORECASE,
+        ).strip()
+        norm = normalizar_texto(bruto)
+        if re.search(
+            r"\b(?:mcp|json|true|false|recurso activo|reglamentos relativos|reglamento relativo|interno sistema|publico home)\b",
+            norm,
+        ) or any(k in bruto.lower() for k in ("incluye_anexo", "recurso_activo", "tipo_documento", "solicitud_")):
+            return ""
+        if not permite_bs and re.search(r"\bbs\.?\s*\d", norm):
+            return ""
+        facs_campo = listar_facultades_mencionadas(bruto)
+        if facultades_permitidas and (facs_campo - facultades_permitidas):
+            return ""
+        if not facultades_permitidas and facs_campo:
+            return ""
+        return bruto
+
+    def _componer_carta_desde_semantica(
+        self,
+        datos_llm: dict[str, Any],
+        tipo_doc: str,
+        referencia_base: str,
+        instruccion_limpia: str,
+        unidad_inferida: str | None,
+        ctx_verificado: dict[str, Any],
+        ficha_mcp: dict[str, Any],
+        codigo_activo: str | None,
+        incluye_anexo: bool,
+        es_nuevo_sin_anexo: bool,
+    ) -> tuple[str, list[str], str]:
+        facultades_permitidas = listar_facultades_mencionadas(instruccion_limpia)
+        if unidad_inferida:
+            facultades_permitidas |= listar_facultades_mencionadas(unidad_inferida)
+        fac_oficial_usuario = resolver_facultad_oficial_uagrm(instruccion_limpia)
+        if fac_oficial_usuario:
+            facultades_permitidas.add(fac_oficial_usuario)
+
+        tiene_costo_real = bool(
+            (ficha_mcp and ficha_mcp.get("costo_bs"))
+            or (
+                ctx_verificado
+                and (
+                    ctx_verificado.get("costo_bs")
+                    or ctx_verificado.get("valor_bs")
+                    or ctx_verificado.get("costo")
+                    or ctx_verificado.get("valor")
+                )
+            )
+        )
+        menciona_precio_usuario = bool(
+            re.search(
+                r"\b(?:bs|bolivian|usd|dolar|precio|costo|valor|presupuesto|cotizacion)\b|\d+\s*(?:bs|\$)",
+                normalizar_texto(instruccion_limpia),
+            )
+        )
+        permite_bs = tiene_costo_real or menciona_precio_usuario
+
+        unidad_llm = self._sanitizar_bloque_semantico(
+            datos_llm.get("unidad_solicitante"), facultades_permitidas, permite_bs=False
+        )
+        unidad_final = (
+            unidad_inferida
+            or (resolver_facultad_oficial_uagrm(unidad_llm) if unidad_llm else None)
+            or unidad_llm
+            or "la Dependencia Universitaria solicitante"
+        )
+        if fac_oficial_usuario and not unidad_inferida:
+            unidad_final = fac_oficial_usuario
+
+        objeto = self._sanitizar_bloque_semantico(
+            datos_llm.get("objeto_concreto"), facultades_permitidas, permite_bs=permite_bs
+        )
+        if not objeto or len(objeto) < 12:
+            objeto = self._extraer_nucleo_solicitud(instruccion_limpia)
+        objeto = objeto.rstrip(" .;:")
+        if objeto and objeto[0].isupper() and not objeto.startswith(("UAGRM", "DUAF", "FICCT", "POA")):
+            objeto = objeto[0].lower() + objeto[1:]
+
+        justificacion = self._sanitizar_bloque_semantico(
+            datos_llm.get("justificacion_tecnica"), facultades_permitidas, permite_bs=permite_bs
+        )
+        impacto = self._sanitizar_bloque_semantico(
+            datos_llm.get("impacto_institucional"), facultades_permitidas, permite_bs=permite_bs
+        )
+        detalle = self._sanitizar_bloque_semantico(
+            datos_llm.get("detalle_complementario"), facultades_permitidas, permite_bs=permite_bs
+        )
+        asunto_llm = self._sanitizar_bloque_semantico(
+            datos_llm.get("asunto_especifico"), facultades_permitidas, permite_bs=False
+        )
+
+        if asunto_llm and len(asunto_llm) >= 12:
+            ref_limpia = asunto_llm.upper().rstrip(" .:")
+            if unidad_final != "la Dependencia Universitaria solicitante" and normalizar_texto(unidad_final) not in normalizar_texto(ref_limpia):
+                referencia = f"{ref_limpia} — {unidad_final.upper()}"
+            else:
+                referencia = ref_limpia
+        else:
+            referencia = self._construir_referencia_especifica(
+                referencia_base=referencia_base,
+                tipo_doc=tipo_doc,
+                codigo_activo=codigo_activo,
+                unidad_inferida=unidad_final if unidad_final != "la Dependencia Universitaria solicitante" else None,
+                instruccion=instruccion_limpia,
+                es_nuevo_sin_anexo=es_nuevo_sin_anexo,
+            )
+
+        if tipo_doc == "SOLICITUD_NUEVO_ACTIVO":
+            p1 = (
+                f"De mi mayor consideración: En representación de {unidad_final}, tengo a bien dirigirme a su autoridad "
+                f"con el debido respeto a objeto de elevar formalmente la solicitud correspondiente a {objeto}, en el marco "
+                "de la planificación institucional vigente y de las Normas Básicas del Sistema de Administración de Bienes y "
+                "Servicios aprobadas mediante Decreto Supremo N° 0181 (NB-SABS)."
+            )
+            p2 = (
+                (f"{justificacion.rstrip('.')}. " if justificacion else "")
+                + (
+                    f"{detalle.rstrip('.')}. "
+                    if detalle and normalizar_texto(detalle) not in normalizar_texto(justificacion)
+                    else ""
+                )
+                + (
+                    f"El requerimiento expuesto por {unidad_final} responde a necesidades académicas, técnicas y operativas "
+                    "debidamente verificadas, cuya atención resulta indispensable para fortalecer el desarrollo continuo de "
+                    "las actividades docentes, prácticas y de gestión universitaria en condiciones acordes a los estándares institucionales."
+                    if len(justificacion.split()) < 22
+                    else ""
+                )
+            ).strip()
+            p3 = (
+                (f"{impacto.rstrip('.')}. " if impacto else "")
+                + "Desde la perspectiva administrativa y de control interno establecida en la Ley N° 1178 (SAFCO), la "
+                "incorporación oportuna de este equipamiento coadyuvará al cumplimiento de las metas institucionales programadas "
+                "en el Plan Operativo Anual (POA), evitando brechas operativas y asegurando la calidad del servicio brindado por la UAGRM."
+            ).strip()
+            p4 = (
+                "Una vez evaluada la disponibilidad presupuestaria y autorizada la adquisición o dotación por las instancias "
+                f"competentes, {unidad_final} asume el compromiso expreso de participar en la verificación técnica de especificaciones, "
+                "recepción conforme, asignación de código patrimonial e inscripción formal del custodio responsable mediante "
+                "Acta Oficial de Entrega ante el Departamento de Activos Fijos."
+            )
+            p5 = (
+                "Por lo anteriormente expuesto y fundamentado, solicito respetuosamente a su autoridad considerar favorablemente "
+                "el presente requerimiento y disponer su derivación a las áreas financieras y administrativas pertinentes para la "
+                "prosecución del trámite reglamentario, quedando a entera disposición para remitir especificaciones técnicas "
+                "detalladas o cotizaciones referenciales cuando sean requeridas."
+            )
+            return referencia, [p1, p2, p3, p4, p5], unidad_final
+
+        marcos_tramite: dict[str, tuple[str, str, str]] = {
+            "SOLICITUD_BAJA": (
+                "elevar a su consideración la solicitud formal de evaluación técnica y desincorporación definitiva (baja patrimonial)",
+                "al amparo del Manual de Procedimientos de Baja de Bienes aprobado mediante Resolución Rectoral N° 449/2013, el Decreto Supremo N° 0181 (NB-SABS) y la Ley N° 1178 (SAFCO)",
+                "instruir la inspección técnica pericial reglamentaria, la emisión del Dictamen Técnico de Baja y la consiguiente descarga contable y disposición física conforme al procedimiento vigente del Departamento de Activos Fijos",
+            ),
+            "SOLICITUD_REVALUO": (
+                "solicitar formalmente la inspección técnica pericial y revalorización contable del bien patrimonial",
+                "conforme al Manual de Revalorización Técnica de Activos Fijos (UAGRM-MRVT-AF, Resolución Rectoral N° 567/2018 V2), las Normas Contables aplicables y el Decreto Supremo N° 24051",
+                "designar a la instancia o comisión técnica evaluadora para determinar el valor razonable y la vida útil remanente del bien, actualizando su registro en el padrón oficial",
+            ),
+            "SOLICITUD_REASIGNACION": (
+                "solicitar autorización para la reasignación y transferencia formal de custodia administrativa",
+                "en estricto cumplimiento del Decreto Supremo N° 0181 (NB-SABS) y la Ley N° 1178 (SAFCO) sobre responsabilidad por la custodia de bienes públicos",
+                "instruir el registro del traspaso en el sistema patrimonial, la actualización del historial de trazabilidad y la emisión del Acta Oficial de Entrega y Reasignación para perfeccionar el descargo correspondiente",
+            ),
+            "SOLICITUD_INVENTARIO": (
+                "solicitar la programación y ejecución de un levantamiento e inventario físico conciliado de bienes",
+                "en cumplimiento de las disposiciones de control y conciliación física establecidas en el Decreto Supremo N° 0181 (NB-SABS) y la Ley N° 1178 (SAFCO)",
+                "disponer el cronograma de verificación física con el equipo técnico de Control Patrimonial hasta la suscripción del Acta de Conciliación e Inventario correspondiente",
+            ),
+            "DESCARGO_INCIDENTE": (
+                "presentar el presente informe de descargo y notificación administrativa oportuna",
+                "en acatamiento de los Artículos 8 y 12 de la Resolución Rectoral N° 449/2013, el Decreto Supremo N° 0181 y la Ley N° 1178 (SAFCO)",
+                "registrar el presente descargo documentado en el expediente patrimonial correspondiente y disponer las verificaciones o acciones administrativas que normativamente procedan",
+            ),
+            "INFORME_TECNICO": (
+                "remitir formalmente el presente Dictamen e Informe Técnico Patrimonial",
+                "sustentado en la verificación física y documental conforme al Decreto Supremo N° 0181 y las Resoluciones Rectorales N° 449/2013 y N° 567/2018 V2",
+                "elevar el presente dictamen a consideración superior para la adopción de la determinación administrativa y patrimonial que corresponda",
+            ),
+            "SOLICITUD_CORRECCION_DATOS": (
+                "solicitar formalmente la rectificación y actualización registral en el padrón institucional de Activos Fijos",
+                "en observancia de los principios de veracidad registral y control interno establecidos por la Ley N° 1178 (SAFCO) y el Decreto Supremo N° 0181 (NB-SABS)",
+                "disponer la verificación por el área técnica de registro e inventario para consolidar la enmienda y emitir la ficha patrimonial actualizada para respaldo de custodia",
+            ),
+        }
+        verbo, marco_legal, petitorio = marcos_tramite.get(
+            tipo_doc, marcos_tramite["SOLICITUD_CORRECCION_DATOS"]
+        )
+
+        p1 = (
+            f"De mi mayor consideración: En representación de {unidad_final}, me dirijo a su autoridad con el debido respeto "
+            f"a objeto de {verbo}, vinculada específicamente a {objeto}, {marco_legal}."
+        )
+        parrafos_comp: list[str] = [p1]
+        if codigo_activo and ctx_verificado:
+            parrafos_comp.append(construir_parrafo_respaldo_activo(ctx_verificado, codigo_activo))
+        elif codigo_activo:
+            parrafos_comp.append(
+                f"El presente trámite administrativo recae sobre el bien patrimonial identificado con el código institucional "
+                f"{codigo_activo}, cuyos antecedentes registrales y de custodia obran en el padrón oficial del Departamento de Activos Fijos."
+            )
+
+        p_just = (
+            (f"{justificacion.rstrip('.')}. " if justificacion else "")
+            + (
+                f"{detalle.rstrip('.')}. "
+                if detalle and normalizar_texto(detalle) not in normalizar_texto(justificacion)
+                else ""
+            )
+            + (
+                "Esta actuación resulta indispensable para resguardar la integridad documental, la trazabilidad histórica "
+                "y la correcta administración del patrimonio universitario bajo responsabilidad de nuestra unidad."
+                if len(justificacion.split()) < 18
+                else ""
+            )
+        ).strip()
+        parrafos_comp.append(p_just)
+
+        p_imp = (
+            (f"{impacto.rstrip('.')}. " if impacto else "")
+            + (
+                "Asimismo, se deja expresa constancia de que se adjunta como Anexo en hoja posterior la Ficha Técnica "
+                "Patrimonial verificada del padrón institucional para respaldo íntegro del expediente."
+                if incluye_anexo
+                else "La presente gestión se ajusta estrictamente a los procedimientos internos de control patrimonial y "
+                "transparencia administrativa vigentes en la Universidad Autónoma Gabriel René Moreno."
+            )
+        ).strip()
+        parrafos_comp.append(p_imp)
+
+        parrafos_comp.append(
+            f"En virtud de lo expuesto, solicito respetuosamente a su autoridad {petitorio}, manifestando nuestra plena "
+            "disposición para coordinar inspecciones técnicas o presentar la documentación complementaria que Jefatura estime pertinente."
+        )
+        return referencia, parrafos_comp, unidad_final
+
+    def _respuesta_carta_es_deficiente(
+        self,
+        referencia: str,
+        parrafos: list[str],
+        instruccion_usuario: str,
+        ctx_verificado: dict[str, Any],
+        ficha_mcp: dict[str, Any] | None = None,
+        unidad_inferida: str | None = None,
+    ) -> str | None:
+        if not parrafos:
+            return "Respuesta del modelo sin párrafos redactados."
+        unido = f"{referencia} {' '.join(parrafos)}"
+        norm = normalizar_texto(unido)
+        if re.search(
+            r"\b(?:mcp|json|true|false|recurso activo|reglamentos relativos|reglamento relativo|interno sistema|publico home)\b",
+            norm,
+        ) or any(
+            k in unido.lower()
+            for k in ("incluye_anexo", "recurso_activo", "tipo_documento", "solicitud_")
+        ):
+            return (
+                "Se aplicó redacción formal institucional verificada al detectar términos técnicos internos en la salida del modelo."
+            )
+
+        facs_permitidas = listar_facultades_mencionadas(instruccion_usuario)
+        if unidad_inferida:
+            facs_permitidas |= listar_facultades_mencionadas(unidad_inferida)
+        facs_salida = listar_facultades_mencionadas(unido)
+        if facs_permitidas and (facs_salida - facs_permitidas):
+            return (
+                "Se ajustó el borrador para preservar exactamente la facultad o unidad indicada en la solicitud."
+            )
+
+        tiene_costo_real = bool(
+            (ficha_mcp and ficha_mcp.get("costo_bs"))
+            or (
+                ctx_verificado
+                and (
+                    ctx_verificado.get("costo_bs")
+                    or ctx_verificado.get("valor_bs")
+                    or ctx_verificado.get("costo")
+                    or ctx_verificado.get("valor")
+                )
+            )
+        )
+        menciona_precio_usuario = bool(
+            re.search(
+                r"\b(?:bs|bolivian|usd|dolar|precio|costo|valor|presupuesto|cotizacion)\b|\d+\s*(?:bs|\$)",
+                normalizar_texto(instruccion_usuario),
+            )
+        )
+        if not tiene_costo_real and not menciona_precio_usuario and re.search(r"\bbs\.?\s*\d", norm):
+            return (
+                "Se sustituyó el borrador para evitar montos estimados en Bs. no respaldados en la solicitud ni en el padrón."
+            )
+        return None
+
+    def _construir_referencia_especifica(
+        self,
+        referencia_base: str,
+        tipo_doc: str,
+        codigo_activo: str | None,
+        unidad_inferida: str | None,
+        instruccion: str,
+        es_nuevo_sin_anexo: bool,
+    ) -> str:
+        if tipo_doc == "SOLICITUD_NUEVO_ACTIVO":
+            base = "SOLICITUD DE ADQUISICIÓN Y DOTACIÓN DE NUEVO EQUIPAMIENTO INSTITUCIONAL"
+            if unidad_inferida:
+                return f"{base} — {unidad_inferida.upper()}"
+            return base
+        if codigo_activo and not es_nuevo_sin_anexo:
+            return f"{referencia_base} — {codigo_activo}"
+        if unidad_inferida:
+            return f"{referencia_base} — {unidad_inferida.upper()}"
+        return referencia_base
+
+    def _extraer_nucleo_solicitud(self, texto: str) -> str:
+        limpio = " ".join(texto.strip().split()).rstrip(" .;")
+        if not limpio:
+            return "el requerimiento institucional descrito"
+        sin_intro = re.sub(
+            r"^(?:como\s+representant?e?s?(?:\s+de\s+[^,;]+)?[,;\s]+|en\s+representaci[oó]n\s+de\s+[^,;]+[,;\s]+|por\s+medio\s+de\s+la\s+presente[,;\s]+)+",
+            "",
+            limpio,
+            flags=re.IGNORECASE,
+        ).strip()
+        sin_verbo = re.sub(
+            r"^(?:solicito|solicitamos|requiero|requerimos|necesito|necesitamos|quiero|pedimos)\s+",
+            "",
+            sin_intro,
+            flags=re.IGNORECASE,
+        ).strip()
+        nucleo = sin_verbo or sin_intro or limpio
+        nucleo = re.sub(r"\bnuestras?\s+", lambda m: "las " if m.group(0).lower().endswith("s ") else "la ", nucleo, flags=re.IGNORECASE)
+        return nucleo
+
     def _formalizar_detalle_usuario(self, texto: str) -> str:
         limpio = " ".join(texto.strip().split()).rstrip(" .;")
         if not limpio:
@@ -779,9 +1240,16 @@ class McpBridgeService:
         ctx: dict[str, Any],
         codigo: str | None,
         incluye_anexo: bool,
+        unidad_inferida: str | None = None,
+        instruccion_corregida: str | None = None,
     ) -> list[str]:
-        solicitante_unidad = payload.solicitante_unidad or "la Dependencia Universitaria solicitante"
-        instruccion_fmt = self._formalizar_detalle_usuario(payload.instruccion_usuario)
+        solicitante_unidad = (
+            unidad_inferida
+            or payload.solicitante_unidad
+            or "la Dependencia Universitaria solicitante"
+        )
+        texto_base = instruccion_corregida or corregir_texto_institucional(payload.instruccion_usuario)
+        nucleo = self._extraer_nucleo_solicitud(texto_base)
 
         if payload.borrador_actual and payload.borrador_actual.cuerpo_parrafos:
             base_parrafos = [str(p).strip() for p in payload.borrador_actual.cuerpo_parrafos if str(p).strip()]
@@ -791,41 +1259,41 @@ class McpBridgeService:
                 pos = len(base_parrafos) - 1 if idx_obj == -1 else int(idx_obj) - 1
                 if 0 <= pos < len(base_parrafos):
                     actualizados = list(base_parrafos)
-                    actualizados[pos] = f"{actualizados[pos].rstrip('. ')}. Asimismo, se precisa que {instruccion_fmt}."
+                    actualizados[pos] = f"{actualizados[pos].rstrip('. ')}. Asimismo, se precisa que {nucleo}."
                     return actualizados
             if base_parrafos:
                 actualizados = list(base_parrafos)
                 objetivo = min(1, len(actualizados) - 1)
-                actualizados[objetivo] = f"{actualizados[objetivo].rstrip('. ')}. En atención a la precisión adicional solicitada: {instruccion_fmt}."
+                actualizados[objetivo] = f"{actualizados[objetivo].rstrip('. ')}. En atención a la precisión adicional solicitada: {nucleo}."
                 return actualizados
 
         if tipo_doc == "SOLICITUD_NUEVO_ACTIVO":
             return [
                 (
-                    f"De mi mayor consideración: En ejercicio de mis funciones administrativas dentro de {solicitante_unidad}, "
-                    "tengo a bien dirigirme a su autoridad con el debido respeto a fin de presentar una solicitud formal de "
-                    "dotación e incorporación de equipamiento institucional bajo los lineamientos de planificación y contratación "
-                    "establecidos en el Decreto Supremo N° 0181 (Normas Básicas del Sistema de Administración de Bienes y Servicios — NB-SABS)."
+                    f"De mi mayor consideración: En representación de {solicitante_unidad}, "
+                    "me dirijo a su autoridad con el debido respeto a objeto de presentar la solicitud formal correspondiente a "
+                    f"{nucleo}, en estricta sujeción a la planificación institucional y a las Normas Básicas del Sistema de "
+                    "Administración de Bienes y Servicios aprobadas mediante Decreto Supremo N° 0181 (NB-SABS)."
                 ),
                 (
-                    f"El requerimiento técnico expuesto por nuestra dependencia comprende lo siguiente: {instruccion_fmt}. "
-                    "La incorporación de este bien resulta indispensable para superar las actuales limitaciones operativas y asegurar la atención "
-                    "oportuna, continua y eficiente de los procesos académicos, investigativos o administrativos asignados a nuestra unidad."
+                    f"El requerimiento expuesto por {solicitante_unidad} responde a necesidades académicas y operativas debidamente constatadas, "
+                    "cuya atención resulta indispensable para fortalecer el desarrollo de actividades formativas, prácticas técnicas, "
+                    "exposiciones académicas y labores administrativas regulares en condiciones adecuadas de calidad universitaria."
                 ),
                 (
-                    "Desde el punto de vista técnico y patrimonial, la asignación solicitada permitirá prevenir demoras en el cumplimiento de metas "
-                    "institucionales, resguardar la continuidad operativa del personal y optimizar la calidad del servicio brindado dentro de la "
-                    "Universidad Autónoma Gabriel René Moreno en concordancia con la programación presupuestaria y operativa vigente."
+                    "Desde el ámbito administrativo y de control interno establecido en la Ley N° 1178 (SAFCO), la incorporación oportuna de "
+                    "estos bienes permitirá cubrir las brechas actuales de equipamiento, prevenir interrupciones en el dictado de clases o "
+                    "prácticas y garantizar la ejecución eficiente de los objetivos trazados en el Plan Operativo Anual (POA) de la unidad."
                 ),
                 (
                     "Una vez evaluada la disponibilidad presupuestaria y autorizada la adquisición o dotación por las instancias competentes, "
-                    f"{solicitante_unidad} se compromete expresamente a coadyuvar en la recepción conforme, verificación de especificaciones técnicas, "
-                    "asignación de código patrimonial e inscripción del custodio responsable mediante Acta Oficial de Entrega del Departamento de Activos Fijos."
+                    f"{solicitante_unidad} asume el compromiso expreso de coadyuvar en la verificación técnica de especificaciones, "
+                    "recepción conforme, asignación de código patrimonial e inscripción formal del custodio responsable mediante Acta de Entrega del Departamento de Activos Fijos."
                 ),
                 (
-                    "Por lo expuesto, solicito gentilmente a su autoridad considerar favorablemente el presente requerimiento y disponer su derivación "
-                    "a las áreas técnicas y administrativas pertinentes para la prosecución del trámite reglamentario. Agradeciendo de antemano su atención, "
-                    "quedo a entera disposición para ampliar información justificativa o respaldo documental."
+                    "Por lo anteriormente fundamentado, solicito respetuosamente a su autoridad considerar favorablemente esta gestión y disponer "
+                    "su derivación a las áreas financieras y de contrataciones pertinentes para la prosecución del trámite reglamentario, quedando "
+                    "a plena disposición para remitir especificaciones técnicas o cotizaciones referenciales cuando sean requeridas."
                 ),
             ]
 
@@ -946,8 +1414,7 @@ class McpBridgeService:
         parrafos = [
             (
                 f"De mi mayor consideración: En representación de {solicitante_unidad}, me dirijo a su autoridad con el debido respeto "
-                f"a objeto de manifestar que {verbo_obj}. El fundamento específico que motiva la presente gestión radica en la siguiente "
-                f"situación administrativa u operativa expuesta: {instruccion_fmt}."
+                f"a objeto de manifestar que {verbo_obj}. La presente gestión institucional atiende específicamente {nucleo}."
             ),
         ]
 
@@ -1427,7 +1894,8 @@ class McpBridgeService:
         settings: Settings,
         emitir_evento: EmitirEventoFn | None = None,
     ) -> ConsultaAnaliticaResponse:
-        q_norm = normalizar_texto(payload.consulta)
+        consulta_corregida = corregir_texto_institucional(payload.consulta)
+        q_norm = normalizar_texto(consulta_corregida)
         if any(p in q_norm for p in PALABRAS_BLOQUEO_EXTERNO):
             return ConsultaAnaliticaResponse(
                 motor_utilizado="respaldo_determinista",
@@ -1443,15 +1911,15 @@ class McpBridgeService:
                 tokens_usados=0,
             )
 
-        formatos_exportacion = detectar_formatos_exportacion_reporte(payload.consulta)
-        incluir_graficas = detectar_incluir_graficas(payload.consulta)
+        formatos_exportacion = detectar_formatos_exportacion_reporte(consulta_corregida)
+        incluir_graficas = detectar_incluir_graficas(consulta_corregida)
 
         tok_cli, tok_seg = self._preparar_contexto_seguridad(settings, payload.contexto_seguridad)
         try:
             trazas_mcp: list[TrazaHerramientaMcp] = []
             filtros_dict, traza_f = await self._llamar_tool_con_traza(
                 "filtrar_catalogo_reportes",
-                {"consulta_usuario": payload.consulta},
+                {"consulta_usuario": consulta_corregida},
                 emitir_evento=emitir_evento,
             )
             trazas_mcp.append(traza_f)
@@ -1503,7 +1971,24 @@ class McpBridgeService:
                 "obtener_estadisticas_padron": args_stats_det,
             }
 
-            if settings.env != "test" or self._transport is not None:
+            obs: dict[str, dict[str, Any]] = {}
+            es_consulta_especializada = any(
+                k in q_norm
+                for k in (
+                    "riesgo",
+                    "candidato",
+                    "random forest",
+                    "proyeccion",
+                    "trazabilidad",
+                    "sha",
+                    "normativa",
+                    "reglamento",
+                    "vida util",
+                )
+            )
+            usar_react = self._transport is not None or es_consulta_especializada
+
+            if (settings.env != "test" or self._transport is not None) and usar_react:
                 try:
                     criterios_obligatorios = {
                         k: v for k, v in args_stats_det.items() if v is not None
@@ -1563,10 +2048,8 @@ class McpBridgeService:
                         motor_usado, _ = _resolver_motor(settings)
                 except (LlmNoConfiguradoError, LlmErrorExternoError):
                     obs = {}
-            else:
-                obs = {}
 
-            # Garantiza anclaje real filtrado incluso si el LLM omitió consultar alguna herramienta DB
+            # Garantiza anclaje real filtrado incluso si el LLM omitió consultar o en vía rápida directa
             busco_db = "buscar_activos_padron" in obs and obs["buscar_activos_padron"].get("ok") is not False
             if not busco_db:
                 busq_obs, traza_b = await self._llamar_tool_con_traza(
@@ -1592,35 +2075,24 @@ class McpBridgeService:
                     estadisticas = stats_obs
 
             if not respuesta_llm:
-                total_filtrados = (estadisticas or {}).get("totalActivos", total_coincidencias_db)
-                valor_filtrados = formatear_bs((estadisticas or {}).get("valorTotalBs", 0))
-                valor_muestra = formatear_bs(
-                    sum(float(a.get("valorBs") or 0) for a in activos_mencionados)
+                respuesta_llm = self._construir_sintesis_ejecutiva_padron(
+                    filtros_det=filtros_det,
+                    estadisticas=estadisticas,
+                    activos_mencionados=activos_mencionados,
+                    total_coincidencias_db=total_coincidencias_db,
+                    formatos_exportacion=formatos_exportacion,
                 )
-                coinc = total_filtrados or total_coincidencias_db or len(activos_mencionados)
-                por_est = [
-                    f"{e.get('estado')}: {e.get('cantidad')}"
-                    for e in ((estadisticas or {}).get("porEstado") or [])[:4]
-                    if isinstance(e, dict)
-                ]
-                resumen_estados = f" Distribución: {', '.join(por_est)}." if por_est else ""
-                nota_export = (
-                    f" Exportación preparada automáticamente en formato(s): {', '.join(f.upper() for f in formatos_exportacion)}."
-                    if formatos_exportacion
-                    else ""
-                )
-                if coinc == 0:
-                    respuesta_llm = (
-                        f"No se encontraron activos que cumplan exactamente con los criterios solicitados "
-                        f"({self._explicar_filtros(filtros_det).rstrip('.')})."
-                    )
-                else:
-                    respuesta_llm = (
-                        f"Resultado verificado exclusivamente para los criterios solicitados "
-                        f"({self._explicar_filtros(filtros_det).rstrip('.')}): "
-                        f"{coinc} bien(es) coincidente(s) por un valor acumulado de {valor_filtrados} "
-                        f"(muestra directa: {len(activos_mencionados)} registro(s), {valor_muestra})."
-                        f"{resumen_estados}{nota_export}"
+                if not usar_react and settings.env != "test":
+                    await _emitir(
+                        emitir_evento,
+                        {
+                            "tipo": "paso",
+                            "id": "sintesis-padron",
+                            "etiqueta": "Consolidando síntesis ejecutiva del informe",
+                            "detalle": "Resumen verificado con datos del padrón",
+                            "duracionMs": 5,
+                            "estado": "completado",
+                        },
                     )
 
             return ConsultaAnaliticaResponse(
@@ -1639,6 +2111,86 @@ class McpBridgeService:
         finally:
             core_bridge_ctx.reset(tok_cli)
             seguridad_mcp_ctx.reset(tok_seg)
+
+    def _construir_sintesis_ejecutiva_padron(
+        self,
+        filtros_det: FiltrosDetectadosReporte,
+        estadisticas: dict[str, Any] | None,
+        activos_mencionados: list[dict[str, Any]],
+        total_coincidencias_db: int,
+        formatos_exportacion: list[str],
+    ) -> str:
+        criterios_txt = self._explicar_filtros(filtros_det).rstrip(".")
+        total_filtrados = int(
+            (estadisticas or {}).get("totalActivos")
+            or total_coincidencias_db
+            or len(activos_mencionados)
+        )
+        if total_filtrados == 0:
+            return (
+                f"No se identificaron activos fijos que cumplan exactamente con los criterios aplicados "
+                f"({criterios_txt}). Verifique la dependencia, estado o palabra clave e intente ajustar la consulta."
+            )
+
+        valor_total = float(
+            (estadisticas or {}).get("valorTotalBs")
+            if estadisticas and estadisticas.get("valorTotalBs") is not None
+            else sum(float(a.get("valorBs") or 0) for a in activos_mencionados)
+        )
+        valor_fmt = formatear_bs(valor_total)
+
+        partes: list[str] = [
+            (
+                f"El presente informe consolida {total_filtrados} bien(es) patrimoniales bajo los criterios aplicados "
+                f"({criterios_txt}), con un valor contable acumulado de {valor_fmt}."
+            )
+        ]
+
+        por_estado = [
+            e for e in ((estadisticas or {}).get("porEstado") or [])[:4] if isinstance(e, dict)
+        ]
+        if por_estado:
+            items_est = [
+                f"{int(e.get('cantidad') or 0)} en estado {e.get('estado')} ({formatear_bs(float(e.get('valorBs') or 0))})"
+                for e in por_estado
+                if int(e.get("cantidad") or 0) > 0
+            ]
+            if items_est:
+                partes.append(f"Distribución por estado: {'; '.join(items_est)}.")
+
+        por_grupo = [
+            g
+            for g in ((estadisticas or {}).get("porGrupoTop") or (estadisticas or {}).get("porGrupo") or [])[:2]
+            if isinstance(g, dict)
+        ]
+        if por_grupo:
+            g0 = por_grupo[0]
+            nombre_g = g0.get("grupo") or g0.get("nombre")
+            cant_g = int(g0.get("cantidad") or 0)
+            val_g = formatear_bs(float(g0.get("valorBs") or 0))
+            if nombre_g and cant_g > 0:
+                partes.append(
+                    f"El principal grupo contable corresponde a {nombre_g} ({cant_g} bien(es), {val_g})."
+                )
+
+        ordenados = sorted(
+            [a for a in activos_mencionados if isinstance(a, dict) and a.get("codigo")],
+            key=lambda x: float(x.get("valorBs") or 0),
+            reverse=True,
+        )[:3]
+        if ordenados:
+            ejemplos = [
+                f"{a.get('codigo')} — {str(a.get('descripcion') or 'Activo')[:42].rstrip()} ({a.get('estado') or 'ACTIVO'}, {formatear_bs(float(a.get('valorBs') or 0))})"
+                for a in ordenados
+            ]
+            partes.append(f"Activos destacados del lote: {'; '.join(ejemplos)}.")
+
+        if formatos_exportacion:
+            partes.append(
+                f"Documento listo para emisión en formato(s): {', '.join(f.upper() for f in formatos_exportacion)}."
+            )
+
+        return " ".join(partes)
 
     async def diagnosticar_metricas(
         self,

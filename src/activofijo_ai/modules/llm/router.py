@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -38,6 +38,7 @@ def get_mcp_bridge_service() -> McpBridgeService:
 
 
 async def _generar_stream_sse(
+    request: Request,
     ejecutor: Callable[[Callable[[dict[str, Any]], Awaitable[None]]], Awaitable[BaseModel]],
 ) -> AsyncIterator[str]:
     cola: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
@@ -59,7 +60,12 @@ async def _generar_stream_sse(
     tarea = asyncio.create_task(correr())
     try:
         while True:
-            item = await cola.get()
+            if await request.is_disconnected():
+                break
+            try:
+                item = await asyncio.wait_for(cola.get(), timeout=0.35)
+            except TimeoutError:
+                continue
             if item is None:
                 break
             yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
@@ -80,13 +86,14 @@ async def asistir_redaccion(
 
 @router.post("/asistir-redaccion/stream")
 async def asistir_redaccion_stream(
+    request: Request,
     payload: RedaccionAsistidaRequest,
     settings: Annotated[Settings, Depends(get_settings)],
     mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
 ) -> StreamingResponse:
     """Emite progreso en tiempo real (SSE) durante la redacción formal."""
     return StreamingResponse(
-        _generar_stream_sse(lambda emit: mcp.asistir_redaccion(payload, settings, emit)),
+        _generar_stream_sse(request, lambda emit: mcp.asistir_redaccion(payload, settings, emit)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -114,13 +121,14 @@ async def asistente_sistema(
 
 @router.post("/asistente-sistema/stream")
 async def asistente_sistema_stream(
+    request: Request,
     payload: AyudaSistemaRequest,
     settings: Annotated[Settings, Depends(get_settings)],
     mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
 ) -> StreamingResponse:
     """Emite pasos en tiempo real (SSE) mientras el asistente consulta fuentes institucionales."""
     return StreamingResponse(
-        _generar_stream_sse(lambda emit: mcp.responder_ayuda_sistema(payload, settings, emit)),
+        _generar_stream_sse(request, lambda emit: mcp.responder_ayuda_sistema(payload, settings, emit)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -138,13 +146,14 @@ async def consulta_analitica(
 
 @router.post("/consulta-analitica/stream")
 async def consulta_analitica_stream(
+    request: Request,
     payload: ConsultaAnaliticaRequest,
     settings: Annotated[Settings, Depends(get_settings)],
     mcp: Annotated[McpBridgeService, Depends(get_mcp_bridge_service)],
 ) -> StreamingResponse:
     """Emite progreso en tiempo real (SSE) durante consultas analíticas del padrón."""
     return StreamingResponse(
-        _generar_stream_sse(lambda emit: mcp.consultar_analitica_padron(payload, settings, emit)),
+        _generar_stream_sse(request, lambda emit: mcp.consultar_analitica_padron(payload, settings, emit)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

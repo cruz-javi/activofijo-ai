@@ -594,3 +594,190 @@ def test_sesion_temporal_hereda_filtros_reporte_y_refina_carta(tmp_path: Path) -
     assert any(t["herramienta"] == "buscar_activos_padron" for t in body_ayuda_cnt["trazas_mcp"])
     assert "buscar_activos_padron" not in body_ayuda_cnt["respuesta"]
     assert any(l["ruta"] == "/usuarios" for l in body_ayuda_cnt["enlaces_directos"]) or body_ayuda_cnt["enlaces_directos"] is not None
+
+
+def test_resolucion_facultades_cercanas_y_cero_ruido_en_busqueda(tmp_path: Path) -> None:
+    client = _crear_cliente(tmp_path)
+    headers = {"X-AI-Internal-Key": CLAVE_TEST}
+
+    # Caso reportado en producción: "facultad de computación o más conocido como la FIC"
+    res_fic = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "Necesito un reporte de todos los activos que se encuentran en la facultad de computación o más conocido como la FIC.",
+            "modulo": "reportes",
+        },
+    )
+    assert res_fic.status_code == 200
+    f_fic = res_fic.json()["filtros_detectados"]
+    assert f_fic["ubicacion"] == "FICCT"
+    assert f_fic["grupo_contable"] is None
+    assert f_fic["search"] is None
+
+    # Error fonético Whisper en facultad + categoría explícita
+    res_typo = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "Muebles en buen estado de la facultad de computasion",
+            "modulo": "reportes",
+        },
+    )
+    assert res_typo.status_code == 200
+    f_typo = res_typo.json()["filtros_detectados"]
+    assert f_typo["ubicacion"] == "FICCT"
+    assert f_typo["grupo_contable"] == "Muebles y Enseres"
+    assert f_typo["estado"] == "BUENO"
+    assert f_typo["search"] is None
+
+    # Categoría computación + facultad de computación simultáneas se preservan ambas sin ruido
+    res_ambas = client.post(
+        "/v1/llm/consulta-analitica",
+        headers=headers,
+        json={
+            "consulta": "Equipos de computación en la facultad de computación",
+            "modulo": "reportes",
+        },
+    )
+    assert res_ambas.status_code == 200
+    f_ambas = res_ambas.json()["filtros_detectados"]
+    assert f_ambas["ubicacion"] == "FICCT"
+    assert f_ambas["grupo_contable"] == "Equipos de Computación"
+    assert f_ambas["search"] is None
+
+    # Clasificación epistolar: baja con mención incidental vs corrección explícita de datos inválidos
+    res_baja = client.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "instruccion_usuario": "Solicito la baja del equipo U04000018 por daño irreparable, favor corregir informe si falta algún dato",
+        },
+    )
+    assert res_baja.status_code == 200
+    assert res_baja.json()["tipo_documento_detectado"] == "SOLICITUD_BAJA"
+
+    res_corr = client.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "instruccion_usuario": "La solicitud de baja para el Activo U04006 tiene datos invalidos o error nuevos, corregir informe técnico.",
+        },
+    )
+    assert res_corr.status_code == 200
+    assert res_corr.json()["tipo_documento_detectado"] == "SOLICITUD_CORRECCION_DATOS"
+
+
+def test_compra_equipamiento_sin_mcp_y_rechaza_alucinacion_bs(tmp_path: Path) -> None:
+    # Caso reportado: compra de televisores en Facultad de Ciencias Contables
+    client = _crear_cliente(tmp_path)
+    headers = {"X-AI-Internal-Key": CLAVE_TEST}
+    res = client.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "instruccion_usuario": "Como representan de la Facultad de Ciencias Contables, solicito la compra de cuatro televisores para nuestras aulas y laboratorios.",
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["tipo_documento_detectado"] == "SOLICITUD_NUEVO_ACTIVO"
+    assert body["incluye_anexo_tecnico"] is False
+    texto = f"{body['referencia']} {' '.join(body['cuerpo_parrafos'])}".lower()
+    assert "facultad de ciencias contables" in texto
+    assert "cuatro televisores" in texto
+    assert "mcp" not in texto
+    assert "como representan" not in texto
+    assert "bs." not in texto
+
+    # Validador intercepta si el modelo alucina "recurso activo mcp" o montos en Bs. no verificados
+    async def mock_ollama_alucinado(_request: httpx.Request) -> httpx.Response:
+        contenido = json.dumps(
+            {
+                "referencia": "SOLICITUD DE CORRECCIÓN DE DATOS",
+                "cuerpo_parrafos": [
+                    "Se requiere un nuevo recurso activo mcp con valor Bs. 10,000 por unidad y incluye_anexo_tecnico false."
+                ],
+                "despedida": "Atentamente.",
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "model": "uagrm-activo-fijo",
+                "choices": [{"message": {"content": contenido}}],
+                "usage": {"total_tokens": 110},
+            },
+        )
+
+    client_guard = _crear_cliente(tmp_path, transport=httpx.MockTransport(mock_ollama_alucinado))
+    res_guard = client_guard.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "instruccion_usuario": "Como representante de la Facultad de Ciencias Contables, solicito la compra de cuatro televisores para aulas.",
+        },
+    )
+    assert res_guard.status_code == 200
+    guard_body = res_guard.json()
+    assert guard_body["tipo_documento_detectado"] == "SOLICITUD_NUEVO_ACTIVO"
+    texto_guard = f"{guard_body['referencia']} {' '.join(guard_body['cuerpo_parrafos'])}".lower()
+    assert "mcp" not in texto_guard
+    assert "10,000" not in texto_guard
+    assert "incluye_anexo" not in texto_guard
+
+
+def test_corrector_fonetico_whisper_y_composicion_semantica_sin_alucinar_facultad(
+    tmp_path: Path,
+) -> None:
+    # Simula salida estructurada de Qwen donde alucinó "Facultad de Medicina y Farmacia"
+    # ante un dictado distorsionado ("famultad de conturia")
+    async def mock_ollama_semantico(_request: httpx.Request) -> httpx.Response:
+        contenido = json.dumps(
+            {
+                "asunto_especifico": "ADQUISICIÓN DE EQUIPAMIENTO AUDIOVISUAL PARA LA FAMULTAD DE CONTURIA",
+                "unidad_solicitante": "Facultad de Medicina y Farmacia",
+                "objeto_concreto": "la adquisición de cuatro (4) televisores para aulas y laboratorios",
+                "justificacion_tecnica": (
+                    "La proyección de contenidos contables y análisis financiero en aula requiere pantallas "
+                    "modernas de alta legibilidad para estudiantes y docentes en prácticas de laboratorio."
+                ),
+                "impacto_institucional": (
+                    "El equipamiento permitirá elevar la calidad de la enseñanza práctica y el desempeño académico."
+                ),
+                "detalle_complementario": "",
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "model": "uagrm-activo-fijo",
+                "choices": [{"message": {"content": contenido}}],
+                "usage": {"total_tokens": 180},
+            },
+        )
+
+    client = _crear_cliente(tmp_path, transport=httpx.MockTransport(mock_ollama_semantico))
+    headers = {"X-AI-Internal-Key": CLAVE_TEST}
+    res = client.post(
+        "/v1/llm/asistir-redaccion",
+        headers=headers,
+        json={
+            "instruccion_usuario": "Como representan de la famultad de conturia, solicito la compra de cuatro televisores para nuestras aulas y laboratorios.",
+        },
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["motor_utilizado"] == "ollama_personalizado"
+    assert body["tipo_documento_detectado"] == "SOLICITUD_NUEVO_ACTIVO"
+    assert len(body["cuerpo_parrafos"]) == 5
+    unido = f"{body['referencia']} {' '.join(body['cuerpo_parrafos'])}"
+    assert "famultad" not in unido.lower()
+    assert "conturia" not in unido.lower()
+    assert "medicina" not in unido.lower()
+    assert "farmacia" not in unido.lower()
+    assert "contaduría" in unido.lower()
+    assert "televisores" in unido.lower()
+    assert "mcp" not in unido.lower()
+    # Carta extensa (>= 220 palabras formales)
+    assert sum(len(p.split()) for p in body["cuerpo_parrafos"]) >= 220

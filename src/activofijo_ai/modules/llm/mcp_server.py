@@ -1,5 +1,6 @@
 """Servidor MCP oficial (FastMCP) de solo lectura para Activos Fijos UAGRM."""
 
+import difflib
 import json
 import re
 import unicodedata
@@ -15,6 +16,10 @@ from activofijo_ai.modules.llm.core_client import (
     CoreMcpBridgeClient,
     core_bridge_ctx,
     seguridad_mcp_ctx,
+)
+from activofijo_ai.modules.llm.corrector_institucional import (
+    corregir_texto_institucional,
+    resolver_facultad_oficial_uagrm,
 )
 from activofijo_ai.modules.llm.knowledge import (
     GUIA_RUTAS_SISTEMA,
@@ -236,33 +241,51 @@ _PALABRAS_NO_SEARCH: frozenset[str] = frozenset(
     {
         "de", "del", "la", "las", "el", "los", "lo", "un", "una", "unos", "unas",
         "en", "por", "para", "con", "sin", "sobre", "entre", "desde", "hasta", "hacia",
-        "y", "o", "u", "a", "al", "que", "cual", "cuales", "cuanto", "cuantos", "cuanta",
-        "hay", "son", "estan", "esta", "este", "estos", "estas", "ese", "esa", "solo", "solamente",
-        "todos", "todas", "todo", "toda", "tengan", "tenga", "tiene", "tienen", "sea", "sean",
-        "quiero", "necesito", "dame", "muestrame", "mostrar", "ver", "lista", "listado",
-        "genera", "generar", "haz", "hazme", "saca", "sacar", "busca", "buscar", "filtralo",
-        "filtra", "filtrar", "reporte", "reportes", "informe", "informes", "consulta", "padron",
-        "inventario", "activo", "activos", "bien", "bienes", "equipo", "equipos", "item", "items",
+        "y", "o", "u", "a", "al", "se", "su", "sus", "me", "nos", "le", "les",
+        "que", "cual", "cuales", "cuanto", "cuantos", "cuanta", "quien", "donde",
+        "cuyo", "cuya", "cuyos", "cuyas", "como", "aqui", "alla", "ahi", "solo", "solamente",
+        "hay", "son", "estan", "esta", "este", "estos", "estas", "ese", "esa", "esos", "esas",
+        "estar", "estaban", "fueron", "seran", "tener", "puede", "pueden", "puedes", "podria",
+        "debe", "deben", "encuentra", "encuentran", "ubicado", "ubicada", "ubicados", "ubicadas",
+        "ubica", "ubican", "ubiquen", "conoce", "conocido", "conocida", "conocidos", "conocidas",
+        "llama", "llamado", "llamada", "llamados", "llamadas", "pertenece", "pertenecen",
+        "perteneciente", "pertenecientes", "corresponde", "corresponden", "asignado", "asignada",
+        "asignados", "asignadas", "registrado", "registrada", "registrados", "registradas",
+        "inventariado", "inventariados", "todos", "todas", "todo", "toda", "tengan", "tenga",
+        "tiene", "tienen", "sea", "sean", "algun", "algunos", "algunas", "algo", "ningun",
+        "ninguno", "mismo", "misma", "tambien", "ademas", "aproximadamente", "decir", "alias",
+        "sigla", "siglas", "quiero", "queremos", "necesito", "necesitamos", "dame", "muestrame",
+        "mostrar", "ver", "lista", "listado", "genera", "generar", "haz", "hazme", "saca",
+        "sacar", "busca", "buscar", "filtralo", "filtra", "filtrar", "detalla", "detallar",
+        "indica", "indicar", "favor", "hola", "buenos", "dias", "tardes", "gracias",
+        "reporte", "reportes", "informe", "informes", "consulta", "padron", "resumen",
+        "conteo", "cantidad", "total", "inventario", "activo", "activos", "bien", "bienes",
+        "equipo", "equipos", "item", "items",
         "vehiculo", "vehiculos", "mueble", "muebles", "enseres", "computadora", "computadoras",
-        "laptop", "laptops", "portatil", "portatiles", "pc", "maquinaria", "herramienta", "herramientas", "edificacion", "edificaciones", "inmueble",
-        "inmuebles", "terreno", "terrenos", "semoviente", "semovientes", "animal", "animales",
-        "estado", "estados", "condicion", "condiciones", "bueno", "buenos", "buen", "buena",
+        "laptop", "laptops", "portatil", "portatiles", "pc", "maquinaria", "herramienta",
+        "herramientas", "edificacion", "edificaciones", "inmueble", "inmuebles", "terreno",
+        "terrenos", "semoviente", "semovientes", "animal", "animales",
+        "estado", "estados", "condicion", "condiciones", "bueno", "buen", "buena",
         "buenas", "regular", "regulares", "malo", "malos", "mal", "mala", "malas",
         "reparacion", "mantenimiento", "baja", "bajas", "dado", "dados", "desincorporado",
         "nuevo", "nuevos", "nueva", "nuevas", "usado", "usados", "usada", "usadas",
         "deteriorado", "deteriorados", "deteriorada", "deterioradas", "inservible", "inservibles",
         "inutilizado", "inutilizados", "danado", "danados", "averiado", "averiados",
-        "unidad", "oficina", "facultad", "departamento", "dependencia", "sede", "area", "campus",
-        "ciencias", "exactas", "tecnologia", "salud", "humana", "administrativa", "financiera",
-        "veterinaria", "veterinarias", "computacion", "telecomunicaciones", "valor", "monto",
-        "precio", "costo", "bs", "boliviano", "bolivianos", "mayor", "mayores", "menor", "menores",
-        "superior", "superiores", "inferior", "inferiores", "mas", "menos", "gestion", "ano",
-        "anio", "marca", "tipo", "exporta", "exportar", "exportalo", "descarga", "descargar",
-        "descargalo", "imprime", "imprimir", "formato", "formatos", "pdf", "excel", "xlsx",
-        "word", "docx", "csv", "grafica", "graficas", "grafico", "graficos", "tres", "ahora",
-        "ficct", "daf", "duaf", "rectorado", "vicerrectorado", "biblioteca", "medicina", "prado",
-        "yabare", "decanato", "auditorio", "postgrado", "derecho", "economia", "humanidades",
-        "camiri", "montero", "vallecito", "cpd", "almacen",
+        "unidad", "unidades", "oficina", "oficinas", "facultad", "facultades", "departamento",
+        "dependencia", "sede", "sedes", "area", "campus", "centro", "experimental", "central",
+        "universitaria", "universitario", "carrera", "programa", "pabellon", "modulo", "bloque",
+        "aula", "ciencias", "exactas", "tecnologia", "salud", "humana", "administrativa",
+        "financiera", "veterinaria", "veterinarias", "computacion", "telecomunicaciones", "cs",
+        "valor", "monto", "precio", "costo", "bs", "boliviano", "bolivianos", "mayor", "mayores",
+        "menor", "menores", "superior", "superiores", "inferior", "inferiores", "mas", "menos",
+        "gestion", "ano", "anio", "marca", "tipo", "exporta", "exportar", "exportalo", "descarga",
+        "descargar", "descargalo", "imprime", "imprimir", "formato", "formatos", "pdf", "excel",
+        "xlsx", "word", "docx", "csv", "grafica", "graficas", "grafico", "graficos", "tres",
+        "ahora", "fic", "ficct", "fcet", "fcv", "daf", "duaf", "rectorado", "vicerrectorado",
+        "biblioteca", "medicina", "prado", "yabare", "decanato", "auditorio", "postgrado",
+        "derecho", "economia", "humanidades", "contaduria", "contables", "auditoria",
+        "agricolas", "agronomia", "juridicas", "politicas", "camiri", "montero",
+        "vallecito", "cpd", "almacen",
     }
 )
 
@@ -314,23 +337,55 @@ def _resolver_search_consulta(consulta_usuario: str, norm: str) -> str | None:
 
 
 _ALIAS_UBICACIONES: tuple[tuple[str, str], ...] = (
+    ("facultad de ciencias de la computacion y telecomunicaciones", "FICCT"),
+    ("facultad de cs de la computacion y telecomunicaciones", "FICCT"),
+    ("facultad de cs. de la computacion y telecomunicaciones", "FICCT"),
+    ("facultad de ciencias de la computacion", "FICCT"),
+    ("facultad de cs de la computacion", "FICCT"),
+    ("facultad de computacion", "FICCT"),
+    ("ciencias de la computacion", "FICCT"),
+    ("cs de la computacion", "FICCT"),
+    ("computacion y telecomunicaciones", "FICCT"),
+    ("ingenieria en sistemas", "FICCT"),
+    ("ingenieria de sistemas", "FICCT"),
+    ("ingenieria informatica", "FICCT"),
     ("ficct", "FICCT"),
+    ("la fic", "FICCT"),
+    ("fic", "FICCT"),
     ("facultad de ciencias veterinarias", "Veterinarias"),
+    ("ciencias veterinarias", "Veterinarias"),
+    ("medicina veterinaria", "Veterinarias"),
     ("veterinarias", "Veterinarias"),
     ("veterinaria", "Veterinarias"),
+    ("zootecnia", "Veterinarias"),
     ("fcv", "Veterinarias"),
-    ("yabare", "Yabaré"),
+    ("centro experimental el prado", "El Prado"),
     ("el prado", "El Prado"),
+    ("prado", "El Prado"),
+    ("centro experimental yabare", "Yabaré"),
+    ("yabare", "Yabaré"),
+    ("facultad de ciencias exactas y tecnologia", "Exactas y Tecnología"),
+    ("ciencias exactas y tecnologia", "Exactas y Tecnología"),
+    ("exactas y tecnologia", "Exactas y Tecnología"),
     ("ciencias exactas", "Exactas y Tecnología"),
+    ("facultad de tecnologia", "Exactas y Tecnología"),
     ("fcet", "Exactas y Tecnología"),
+    ("facultad de ciencias de la salud humana", "Salud Humana"),
+    ("ciencias de la salud humana", "Salud Humana"),
+    ("ciencias de la salud", "Salud Humana"),
     ("salud humana", "Salud Humana"),
+    ("facultad de medicina", "Salud Humana"),
     ("medicina", "Salud Humana"),
-    ("daf", "DAF"),
-    ("duaf", "DAF"),
+    ("direccion administrativa y financiera", "DAF"),
     ("administrativa y financiera", "DAF"),
+    ("duaf", "DAF"),
+    ("daf", "DAF"),
+    ("biblioteca central universitaria", "Biblioteca"),
+    ("biblioteca central", "Biblioteca"),
     ("biblioteca", "Biblioteca"),
-    ("rectorado", "Rectorado"),
+    ("rectorado y vicerrectorado", "Rectorado"),
     ("vicerrectorado", "Rectorado"),
+    ("rectorado", "Rectorado"),
     ("decanato", "DECANATO"),
     ("auditorio", "AUDITORIO"),
     ("postgrado", "POSTGRADO"),
@@ -338,6 +393,14 @@ _ALIAS_UBICACIONES: tuple[tuple[str, str], ...] = (
     ("derecho", "DERECHO"),
     ("economia", "ECONOMIA"),
     ("humanidades", "HUMANIDADES"),
+    ("facultad de ciencias contables", "ECONOMIA"),
+    ("ciencias contables", "ECONOMIA"),
+    ("facultad de contaduria", "ECONOMIA"),
+    ("contaduria publica", "ECONOMIA"),
+    ("contaduria", "ECONOMIA"),
+    ("auditoria financiera", "ECONOMIA"),
+    ("ciencias agricolas", "AGRONOMIA"),
+    ("agronomia", "AGRONOMIA"),
     ("camiri", "CAMIRI"),
     ("montero", "MONTERO"),
     ("vallecito", "VALLECITO"),
@@ -347,8 +410,25 @@ _ALIAS_UBICACIONES: tuple[tuple[str, str], ...] = (
 
 _STOP_UBICACION_DINAMICA = (
     r"\b(?:en\s+(?:mal|buen|regular)\s+estado|estado\s+\w+|condicion\s+\w+|"
-    r"con\s+valor|mayor(?:es)?|menor(?:es)?|entre\s+\d|gestion\s+20\d{2}|"
+    r"o\s+(?:mas\s+)?conocid[oa]\s+como|tambien\s+(?:conocid[oa]|llamad[oa])\s+como|"
+    r"es\s+decir|que\s+queda|con\s+valor|mayor(?:es)?|menor(?:es)?|entre\s+\d|gestion\s+20\d{2}|"
     r"de\s+la\s+gestion|exporta\w*|en\s+pdf|en\s+excel|en\s+word|con\s+grafic\w*)\b"
+)
+
+_REFERENCIAS_FUZZY_UNIDAD: tuple[tuple[str, str], ...] = (
+    ("computacion telecomunicaciones sistemas informatica ficct fic", "FICCT"),
+    ("exactas tecnologia ingenieria civil quimica fcet", "Exactas y Tecnología"),
+    ("veterinaria veterinarias zootecnia fcv", "Veterinarias"),
+    ("el prado centro experimental prado", "El Prado"),
+    ("yabare centro experimental yabare", "Yabaré"),
+    ("salud humana medicina enfermeria bioquimica", "Salud Humana"),
+    ("direccion administrativa financiera daf duaf", "DAF"),
+    ("biblioteca central universitaria", "Biblioteca"),
+    ("rectorado vicerrectorado", "Rectorado"),
+    ("ciencias economicas economia contaduria contables auditoria financiera", "ECONOMIA"),
+    ("ciencias juridicas derecho politicas", "DERECHO"),
+    ("ciencias agricolas agronomia", "AGRONOMIA"),
+    ("humanidades educacion", "HUMANIDADES"),
 )
 
 
@@ -377,29 +457,100 @@ def _parse_monto_bo(raw: str) -> float | None:
         return None
 
 
-def _resolver_ubicacion_consulta(consulta_usuario: str, norm: str) -> str | None:
-    if any(p in norm for p in ("todas las unidades", "todas las oficinas", "todo el padron", "toda la universidad")):
+def _mejor_unidad_cercana(fragmento: str) -> str | None:
+    """Empareja una mención libre o con errores fonéticos con la unidad institucional UAGRM más cercana."""
+    tokens = [
+        tk
+        for tk in re.findall(r"[a-z0-9]{3,}", normalizar_texto(fragmento))
+        if tk not in {"de", "del", "la", "el", "en", "y", "los", "las", "facultad", "unidad", "oficina", "centro", "experimental", "direccion", "carrera"}
+    ]
+    if not tokens:
         return None
+
+    mejor_unidad: str | None = None
+    mejor_puntaje = 0.0
+    for ref_claves, unidad_canon in _REFERENCIAS_FUZZY_UNIDAD:
+        palabras_ref = ref_claves.split()
+        coincidencias = 0.0
+        for tk in tokens:
+            mejor_tk = max(
+                difflib.SequenceMatcher(None, tk, pal).ratio()
+                for pal in palabras_ref
+            )
+            if mejor_tk >= 0.76:
+                coincidencias += mejor_tk
+        puntaje = coincidencias / max(len(tokens), 1)
+        if puntaje > mejor_puntaje:
+            mejor_puntaje = puntaje
+            mejor_unidad = unidad_canon
+
+    if mejor_unidad and mejor_puntaje >= 0.72:
+        return mejor_unidad
+    return None
+
+
+def _suprimir_clausula_ubicacion(norm: str, inicio: int, fin: int) -> str:
+    """Remueve de la consulta normalizada el sintagma locativo y su posible explicación de alias."""
+    prefijo = norm[:inicio]
+    m_pre = re.search(
+        r"(?:(?:se\s+)?(?:encuentr[ae]n?|ubicad[oa]s?|pertenec\w+|asignad[oa]s?)\s+)?"
+        r"(?:en|de|a|para)?\s*(?:l[ao]s?|el)?\s*"
+        r"(?:facultad(?:es)?|unidad(?:es)?|oficina(?:s)?|departamento|dependencia|direccion|carrera|centro(?:\s+experimental)?|sede)?\s*"
+        r"(?:de\s+(?:l[ao]s?|el)\s+|de\s+|del\s+)?$",
+        prefijo,
+    )
+    ini_real = m_pre.start() if m_pre and m_pre.group(0).strip() else inicio
+
+    sufijo = norm[fin:]
+    m_suf = re.match(
+        r"^(?:\s*(?:,|;)?\s*(?:o\s+(?:mas\s+)?conocid[oa]\s+como|tambien\s+(?:conocid[oa]|llamad[oa])\s+como|"
+        r"es\s+decir|alias|siglas?|o\s+(?:la|el)\s+facultad(?:\s+de)?)\s+"
+        r"(?:(?:la|el|las|los)\s+)?[a-z0-9\.\-]{2,25}(?:\s+[a-z0-9\.\-]{2,20}){0,4})",
+        sufijo,
+    )
+    fin_real = fin + (m_suf.end() if m_suf else 0)
+    limpio = f"{norm[:ini_real]} {norm[fin_real:]}"
+    return " ".join(limpio.split())
+
+
+def _resolver_ubicacion_con_fragmento(norm: str) -> tuple[str | None, str]:
+    if any(
+        p in norm
+        for p in ("todas las unidades", "todas las oficinas", "todo el padron", "toda la universidad")
+    ):
+        return None, norm
+
     for clave, valor_canon in _ALIAS_UBICACIONES:
-        if re.search(rf"\b{re.escape(clave)}\b", norm):
-            return valor_canon
+        m_alias = re.search(rf"\b{re.escape(clave)}\b", norm)
+        if m_alias:
+            norm_restante = _suprimir_clausula_ubicacion(norm, m_alias.start(), m_alias.end())
+            return valor_canon, norm_restante
+
     m_dyn = re.search(
-        r"(?:en\s+(?:la|el)\s+|de\s+(?:la|el)\s+)?(?:facultad|unidad|oficina|departamento|direccion|carrera|centro|sede)\s+(?:de\s+)?([a-z0-9\s\.\-]{3,50})",
+        r"(?:en\s+(?:la|el)\s+|de\s+(?:la|el)\s+)?(?:facultad|unidad|oficina|departamento|direccion|carrera|centro|sede)\s+(?:de\s+(?:la|el)\s+|de\s+|del\s+)?([a-z0-9\s\.\-]{3,55})",
         norm,
     )
     if m_dyn:
         frag = re.split(_STOP_UBICACION_DINAMICA, m_dyn.group(1))[0].strip(" .,;:-")
-        if frag and frag not in _UNIDADES_GENERICAS_IGNORADAS and len(frag) >= 3:
-            # Conservar capitalización natural del texto original si es posible
-            idx = norm.find(frag)
-            if idx != -1:
-                return frag.title() if len(frag) > 5 else frag.upper()
-    return None
+        cercana = _mejor_unidad_cercana(frag)
+        norm_restante = _suprimir_clausula_ubicacion(norm, m_dyn.start(1), m_dyn.start(1) + len(frag))
+        if cercana:
+            return cercana, norm_restante
+        palabras_frag = [p for p in frag.split() if p not in {"la", "el", "de", "del", "los", "las"}]
+        if frag and frag not in _UNIDADES_GENERICAS_IGNORADAS and 3 <= len(frag) <= 32 and len(palabras_frag) <= 3:
+            return (frag.title() if len(frag) > 5 else frag.upper()), norm_restante
+    return None, norm
+
+
+def _resolver_ubicacion_consulta(consulta_usuario: str, norm: str) -> str | None:
+    ubicacion, _ = _resolver_ubicacion_con_fragmento(norm)
+    return ubicacion
 
 
 def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
     """Traduce criterios complejos en lenguaje natural hacia filtros exactos del padrón PostgreSQL UAGRM."""
-    norm = normalizar_texto(consulta_usuario)
+    consulta_corregida = corregir_texto_institucional(consulta_usuario)
+    norm = normalizar_texto(consulta_corregida)
     if not norm:
         return {
             "search": None,
@@ -411,6 +562,8 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
             "valor_max": None,
             "gestion": None,
         }
+
+    ubicacion, norm_sin_ubicacion = _resolver_ubicacion_con_fragmento(norm)
 
     estado: str | None = None
     if any(p in norm for p in ("en reparacion", "reparacion", "mantenimiento", "por reparar", "en taller")):
@@ -424,7 +577,7 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
         estado = "MALO"
     elif "estado regular" in norm or re.search(r"\bregular(?:es)?\b", norm):
         estado = "REGULAR"
-    elif any(p in norm for p in ("buen estado", "estado bueno", "optimo", "optimas")) or re.search(
+    elif any(p in norm for p in ("buen estado", "estado bueno", "en buen uso", "optimo", "optimas")) or re.search(
         r"\bbuenos?\b|\bbuenas?\b", norm
     ):
         estado = "BUENO"
@@ -447,30 +600,28 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
 
     grupo: str | None = None
     if any(
-        p in norm
+        p in norm_sin_ubicacion
         for p in ("comput", "laptop", "portatil", "pc ", "servidor", "impresora", "monitor", "comunicacion", "telecom", "red ")
-    ) and "facultad de cs. de la computacion" not in norm and "de la computacion" not in norm:
+    ):
         grupo = "Equipos de Computación"
-    elif any(p in norm for p in ("muebl", "enseres", "escritorio", "silla", "estante", "mesa", "archivador", "armario", "butaca")):
+    elif any(p in norm_sin_ubicacion for p in ("muebl", "enseres", "escritorio", "silla", "estante", "mesa", "archivador", "armario", "butaca")):
         grupo = "Muebles y Enseres"
-    elif any(p in norm for p in ("vehic", "automotor", "camioneta", "vagoneta", "bus ", "automovil", "camion")):
+    elif any(p in norm_sin_ubicacion for p in ("vehic", "automotor", "camioneta", "vagoneta", "bus ", "automovil", "camion")):
         grupo = "Vehículos"
-    elif any(p in norm for p in ("maquinaria", "laboratorio", "microscopio", "equipo medico", "generador", "centrifuga", "compresor")):
+    elif any(p in norm_sin_ubicacion for p in ("maquinaria", "laboratorio", "microscopio", "equipo medico", "generador", "centrifuga", "compresor")):
         grupo = "Maquinaria y Equipo"
-    elif any(p in norm for p in ("herramienta", "equipo tecnico", "taladro", "soldador")):
+    elif any(p in norm_sin_ubicacion for p in ("herramienta", "equipo tecnico", "taladro", "soldador")):
         grupo = "Herramientas"
-    elif any(p in norm for p in ("edificacion", "edificio", "inmueble", "infraestructura")):
+    elif any(p in norm_sin_ubicacion for p in ("edificacion", "edificio", "inmueble", "infraestructura")):
         grupo = "Edificaciones"
-    elif any(p in norm for p in ("terreno", "lote", "predio")):
+    elif any(p in norm_sin_ubicacion for p in ("terreno", "lote", "predio")):
         grupo = "Terrenos"
-    elif any(p in norm for p in ("semoviente", "pedigree", "ganado", "reproductor")):
+    elif any(p in norm_sin_ubicacion for p in ("semoviente", "pedigree", "ganado", "reproductor")):
         grupo = "Semovientes"
-    elif "animal" in norm and "trabajo" in norm:
+    elif "animal" in norm_sin_ubicacion and "trabajo" in norm_sin_ubicacion:
         grupo = "Animales de Trabajo"
-    elif any(p in norm for p in ("patrimonio historico", "historico", "artistico", "cultural")):
+    elif any(p in norm_sin_ubicacion for p in ("patrimonio historico", "historico", "artistico", "cultural")):
         grupo = "Patrimonio Histórico"
-
-    ubicacion = _resolver_ubicacion_consulta(consulta_usuario, norm)
 
     valor_min: float | None = None
     valor_max: float | None = None
@@ -505,7 +656,7 @@ def filtrar_catalogo_reportes(consulta_usuario: str) -> dict[str, Any]:
     if m_anio:
         gestion = int(m_anio.group(1))
 
-    search = _resolver_search_consulta(consulta_usuario, norm)
+    search = _resolver_search_consulta(consulta_usuario, norm_sin_ubicacion)
 
     return {
         "search": search,
@@ -900,24 +1051,69 @@ def detectar_incluir_graficas(consulta_usuario: str) -> bool:
     return bool(re.search(r"\b(?:grafic[oa]s?|diagramas?|grafico de barras|grafico circular)\b", norm))
 
 
+def extraer_unidad_solicitante(instruccion_usuario: str) -> str | None:
+    """Extrae la facultad, carrera o unidad universitaria solicitante desde lenguaje natural."""
+    corregida = corregir_texto_institucional(instruccion_usuario)
+    facultad_oficial = resolver_facultad_oficial_uagrm(corregida)
+    if facultad_oficial:
+        return facultad_oficial
+
+    texto = " ".join(corregida.strip().split())
+    if not texto:
+        return None
+    m = re.search(
+        r"(?:de\s+la|de\s+el|del|para\s+la|para\s+el|en\s+la|en\s+el)\s+"
+        r"((?:Facultad|Carrera|Direcci[oó]n|Unidad|Departamento|Centro|Instituto|Decanato|Vicerrectorado|Rectorado|Biblioteca)"
+        r"(?:\s+(?:de|del|de\s+la|de\s+las|de\s+los|y|e))?(?:\s+[A-ZÁÉÍÓÚÑa-záéíóúñ\.]{2,24}){1,6})",
+        texto,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    crudo = re.split(
+        r"\b(?:solicito|solicitamos|requiero|requerimos|necesito|necesitamos|pido|pedimos|para\s+nuestr|con\s+el\s+fin|por\s+lo|,\s*solicito)\b",
+        m.group(1),
+        flags=re.IGNORECASE,
+    )[0].strip(" .,;:-")
+    if len(crudo) < 6:
+        return None
+    palabras_min = {"de", "del", "la", "las", "los", "y", "e"}
+    partes = crudo.split()
+    normalizadas = [
+        p.lower() if idx > 0 and p.lower() in palabras_min else p[0].upper() + p[1:]
+        for idx, p in enumerate(partes)
+    ]
+    return " ".join(normalizadas)
+
+
 def clasificar_intencion_redaccion(instruccion_usuario: str) -> dict[str, Any]:
     """Clasifica el tipo de trámite UAGRM (baja, revalúo, corrección, etc.) desde texto libre."""
     q = normalizar_texto(instruccion_usuario)
-    if any(
+    es_correccion_explicita = any(
         p in q
         for p in (
-            "nuevo activo",
-            "dotacion",
-            "adquisicion",
-            "comprar",
-            "equipamiento nuevo",
-            "adquirir",
-            "provision de nuevo",
+            "datos invalidos",
+            "dato invalido",
+            "tiene error",
+            "tienen error",
+            "error en la solicitud",
+            "datos errados",
+            "corregir los datos",
+            "corregir datos",
+            "rectificar datos",
         )
-    ):
+    ) and any(p in q for p in ("corregir", "correccion", "datos"))
+
+    if re.search(
+        r"\b(?:compras?|comprar|adquisicion(?:es)?|adquirir|dotacion(?:es)?|dotar|"
+        r"equipamiento(?:\s+nuevo)?|nuevos?\s+activos?|nuevos?\s+equipos?|provision\s+de)\b",
+        q,
+    ) or "nuevo activo" in q:
         tipo = "SOLICITUD_NUEVO_ACTIVO"
     elif any(p in q for p in ("descargo", "incidente", "extravio", "robo", "hurto", "siniestro", "sustraccion", "perdida")):
         tipo = "DESCARGO_INCIDENTE"
+    elif es_correccion_explicita:
+        tipo = "SOLICITUD_CORRECCION_DATOS"
     elif any(
         p in q
         for p in (
@@ -1057,27 +1253,27 @@ async def consultar_proyeccion_random_forest(horizonte_meses: int = 6) -> dict[s
 
 
 def prompt_redaccion_carta_uagrm(recurso_mcp_json: str, instruccion_usuario: str) -> str:
-    """Plantilla formal MCP para redacción de notas administrativas extensas y detalladas UAGRM."""
+    """Plantilla estructurada de análisis semántico para redactar cartas formales extensas UAGRM."""
     return (
-        "Eres el Secretario Administrativo y Técnico del Departamento de Activos Fijos de la UAGRM (Bolivia). "
-        "Redacta una CARTA ADMINISTRATIVA OFICIAL extensa, sólida, formal y pulcra en español administrativo boliviano, "
-        "anclada EXCLUSIVAMENTE en los hechos y valores verificados del Recurso MCP adjunto.\n"
-        f"Recurso MCP: {recurso_mcp_json}\n"
-        f"Instrucción / necesidad del solicitante: {instruccion_usuario}\n\n"
-        "Reglas estrictas de calidad y redacción:\n"
-        "1. NUNCA repitas textualmente la frase informal del usuario como muletilla ('conforme al motivo: ...'); "
-        "transforma su intención en prosa jurídica y técnica de alto nivel institucional.\n"
-        "2. NO incluyas fecha, destinatario, 'Señor(a)', 'Presente.-', firmas ni despedida dentro de 'cuerpo_parrafos' "
-        "(el encabezado Word/PDF los incorpora automáticamente).\n"
-        "3. Moneda oficial: Bolivianos abreviado estrictamente como 'Bs.' (NUNCA uses Bs.S ni dólares).\n"
-        "4. Redacta 4 a 5 párrafos sustanciales y bien desarrollados (al menos 55 a 85 palabras por párrafo) en 'cuerpo_parrafos':\n"
-        "   - Párrafo 1 (Antecedentes y Objeto): Identifica la unidad solicitante, invoca la responsabilidad funcional/custodia y expone con claridad el objeto administrativo del trámite.\n"
-        "   - Párrafo 2 (Detalle Técnico / Patrimonial): Si 'recurso_activo_mcp' tiene datos, detalla código exacto, descripción, ubicación, estado y valor en Bs.; si es 'SOLICITUD_NUEVO_ACTIVO', fundamenta la brecha operativa, utilidad académica/administrativa y especificaciones técnicas del equipamiento requerido.\n"
-        "   - Párrafo 3 (Justificación Técnica y Motivación): Desarrolla los argumentos causales (falla técnica, obsolescencia, vida útil remanente, inconsistencia de registro, traspaso de custodia o urgencia operativa según corresponda).\n"
-        "   - Párrafo 4 (Fundamento Normativo y Procedimiento): Invoca con propiedad la normativa pertinente del Recurso MCP (D.S. N° 0181, Ley N° 1178, R.R. N° 449/2013, R.R. N° 567/2018 V2) y, si 'incluye_anexo_tecnico' es true, señala expresamente que se adjunta el Informe Técnico / Ficha Patrimonial en anexo.\n"
-        "   - Párrafo 5 (Petición Concreta y Disposición): Formula el petitorio administrativo expreso para su providencia y manifiesta plena disposición para verificación técnica o documental.\n\n"
-        "Devuelve SOLO un objeto JSON válido con estas claves exactas:\n"
-        '{"referencia": string, "cuerpo_parrafos": [string, string, string, string, string], "despedida": string}'
+        "Analiza la solicitud administrativa universitaria UAGRM (Bolivia) y genera los bloques "
+        "semánticos de alto nivel formal para redactar una carta oficial seria, extensa y precisa.\n\n"
+        "ANTECEDENTES OFICIALES:\n"
+        f"{recurso_mcp_json}\n\n"
+        "SOLICITUD DEL USUARIO:\n"
+        f"{instruccion_usuario}\n\n"
+        "REGLAS ESTRICTAS:\n"
+        "1. Corrige ortografía y errores de dictado (ej. 'famultad' -> 'Facultad', 'conturia' -> 'Contaduría').\n"
+        "2. Usa EXCLUSIVAMENTE la unidad o facultad mencionada por el usuario; JAMÁS menciones ni inventes otra facultad distinta.\n"
+        "3. PROHIBIDO inventar precios o montos en Bs., códigos patrimoniales ni estados físicos que no estén en los antecedentes.\n"
+        "4. PROHIBIDO usar palabras técnicas internas ('MCP', 'JSON', 'true', 'false', 'recurso activo') ni encabezados ('Señor...').\n"
+        "5. Redacta cada campo en prosa institucional boliviana formal, específica al pedido real del usuario:\n"
+        '   - "asunto_especifico": título oficial en MAYÚSCULAS resumiendo el trámite y bien solicitado.\n'
+        '   - "unidad_solicitante": nombre correcto y oficial de la facultad o unidad solicitante.\n'
+        '   - "objeto_concreto": frase sustantiva formal que describe exactamente qué se solicita (ej. "la adquisición e incorporación de cuatro (4) televisores destinados al equipamiento audiovisual de las aulas y laboratorios").\n'
+        '   - "justificacion_tecnica": 2 a 3 oraciones sólidas y coherentes explicando la necesidad académica, técnica u operativa concreta de este caso específico.\n'
+        '   - "impacto_institucional": 1 a 2 oraciones formales sobre el beneficio esperado para docencia, investigación, control patrimonial o continuidad operativa.\n'
+        '   - "detalle_complementario": 1 oración formal con precisiones específicas mencionadas por el usuario (fallas, destino, marca, plazos), o "" si no aplica.\n\n'
+        "Devuelve EXCLUSIVAMENTE un objeto JSON válido con esas 6 claves exactas."
     )
 
 

@@ -12,12 +12,18 @@ import av
 import numpy as np
 from faster_whisper import WhisperModel
 
+from activofijo_ai.modules.llm.corrector_institucional import corregir_texto_institucional
+
 FRECUENCIA_MUESTREO_WHISPER = 16_000
 MAX_BYTES_AUDIO = 4_200_000
 MAX_SEGUNDOS_AUDIO = 45
 PROMPT_CONTEXTO_UAGRM = (
-    "UAGRM, Activo Fijo, FICCT, DUAF, revalúo técnico, baja patrimonial, "
-    "inventario, computadora, proyector, escritorio, código patrimonial, bolivianos."
+    "UAGRM, Activo Fijo, DUAF, Facultad de Contaduría Pública, Facultad de Ciencias Contables, "
+    "Facultad de Ciencias de la Computación y Telecomunicaciones FICCT, Facultad de Ciencias Exactas y Tecnología, "
+    "Facultad de Ciencias Veterinarias, Facultad de Ciencias de la Salud Humana, Medicina, Derecho, Economía, "
+    "Humanidades, Agronomía, Biblioteca Central, Rectorado, aulas y laboratorios, televisores, proyectores, "
+    "computadoras, muebles, solicitud de compra, adquisición, dotación, baja patrimonial, revalúo técnico, "
+    "inventario físico, reporte en PDF, Excel y Word, bolivianos."
 )
 PROMPT_CONTEXTO_INSPECCION_MOVIL = (
     "Inspección física UAGRM: estado bueno, regular o malo, sin novedad, rayado, roto, "
@@ -250,8 +256,8 @@ class ServicioTranscripcionVoz:
         usar_vad = self._modelo_inyectado is None
         kwargs_transcribe: dict[str, Any] = {
             "language": idioma_corto,
-            "beam_size": 1,
-            "best_of": 1,
+            "beam_size": 1 if modo_inspeccion else 3,
+            "best_of": 1 if modo_inspeccion else 3,
             "temperature": 0.0,
             "vad_filter": usar_vad,
             "no_speech_threshold": 0.58,
@@ -276,6 +282,8 @@ class ServicioTranscripcionVoz:
             if not _es_segmento_ruido_o_alucinacion(seg, str(getattr(seg, "text", "") or ""))
         ]
         texto_final = " ".join(partes).strip()
+        if texto_final and not modo_inspeccion:
+            texto_final = corregir_texto_institucional(texto_final)
 
         return ResultadoTranscripcionVoz(
             texto=texto_final,
